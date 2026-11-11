@@ -53,7 +53,7 @@ bash script/run_dinr_stage1_mask_ablation_3gpu.sh 0 1 2
 
 ### 第一阶段 mask 对比结果
 
-**以下是第一阶段 mask pilot 的 train/valid 曲线。** 其中整-note `timestep_random` 是有效的 legacy timestep 结果；它会 mask pitch，与后续保留 pitch 的配置不同。该组统一 test HR 与修正后的六组结果见 [EXPERIMENTS_COMPLETE.md](EXPERIMENTS_COMPLETE.md)。曲线仍见 [loss_curves.png](../analysis/dinr_stage1_mask_ablation/loss_curves.png)，原始表格见 [losses.csv](../analysis/dinr_stage1_mask_ablation/losses.csv)。
+**以下是第一阶段 mask pilot 的 train/valid 曲线。** 其中整-note `timestep_random` 是有效的 legacy timestep 结果；它会 mask pitch，与后续保留 pitch 的配置不同。该组统一 test HR 与修正后的六组结果见 [epx1111_DINR_VAR.md](epx1111_DINR_VAR.md)。曲线仍见 [loss_curves.png](../analysis/dinr_stage1_mask_ablation/loss_curves.png)，原始表格见 [losses.csv](../analysis/dinr_stage1_mask_ablation/losses.csv)。
 
 | Epoch | Attribute train | Attribute valid | Timestep train | Timestep valid | No-mask train | No-mask valid |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -74,7 +74,7 @@ bash script/run_dinr_stage1_mask_ablation_3gpu.sh 0 1 2
 
 在这次单 seed 对照中，no-mask 训练 loss 下降最快，但 valid loss 从 ep4 起持续回升，符合明显过拟合；属性级和整 timestep mask 都显著减小 ep8 相对各自最佳 valid 的回升。整 timestep mask 的最低 valid 比属性级 mask 低 0.535，ep8 也低 0.503；属性级组则在 ep7 才达到最低点。no-mask 的 ep4 最低 valid 仍略低于两个 mask 组，但继续训练会快速恶化，因此早停 epoch 的选择很重要。
 
-三种配置可用相同 loss 作横向参考，但 mask 保留的信息量不同：属性级 mask 总是保留 decoder pitch，并平均保留 1.5/3 个 performance 属性；整 timestep mask 会一并遮掉 pitch 和全部 performance 属性；no-mask 保留所有历史输入。整-note timestep 结果已用 best-valid checkpoint 完成统一 test MIDI 评估并列入总表；它与 retain-pitch 实验不是只改变 pitch mask 的严格单变量对照。单 seed 结果不能说明性能差异具有统计显著性。
+三种配置可用相同 loss 作横向参考，但 mask 保留的信息量不同：属性级 mask 总是保留 decoder pitch，并平均保留 1.5/3 个 performance 属性；整 timestep mask 会一并遮掉 pitch 和全部 performance 属性；no-mask 保留所有历史输入。retain-pitch 的三个属性 mask 向量总是同时替换并相加，forward 上等价于一个 effective mask vector；若与旧整-note mask vector 匹配，两者只差 pitch embedding。不过当前 checkpoint 的 effective mask norm 不同，因此总表里的 HR 差异不能单独归因于 pitch。单 seed 结果也不能说明性能差异具有统计显著性。
 
 保存策略为每 epoch checkpoint、`eval_loss` 选 best、`save_total_limit=2` 保留 best 与 latest。完成后的 checkpoint 为：attribute `checkpoint-2254`（best ep7）与 `checkpoint-2576`（last ep8）；timestep `checkpoint-1932`（best ep6）与 `checkpoint-2576`（last ep8）；no-mask `checkpoint-1288`（best ep4）与 `checkpoint-2576`（last ep8）。输出根目录不另存重复模型权重。
 

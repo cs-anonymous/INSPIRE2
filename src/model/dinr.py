@@ -100,8 +100,10 @@ class DINRAbsoluteModel(nn.Module):
             self.pedal_mode != "none" and self.num_input_slots != 8
         ):
             raise ValueError("num_input_slots must be 4 or 8; pedal heads require 8 slots")
-        if self.decoder_mask_mode not in {"note", "attribute", "timestep"}:
-            raise ValueError("decoder_mask_mode must be note, attribute, or timestep")
+        if self.decoder_mask_mode not in {"note", "attribute", "timestep", "timestep_single"}:
+            raise ValueError(
+                "decoder_mask_mode must be note, attribute, timestep, or timestep_single"
+            )
         self.backbone = PianoT5GemmaModel(self.config)
         self.backbone.encoder = DINRNoteEncoder(self.config.encoder)
         self.token_embedding = nn.Embedding(
@@ -306,6 +308,15 @@ class DINRAbsoluteModel(nn.Module):
             ) & maskable.unsqueeze(-1)
         return dropped
 
+    def _mask_decoder_timestep_single(self, decoder_tokens, decoder_attention_mask):
+        if (not self.training or self.decoder_mask_mode != "timestep_single"
+                or self.decoder_mask_probability <= 0.0 or decoder_tokens.shape[1] <= 1):
+            return None
+        maskable = decoder_attention_mask.bool().clone()
+        maskable[:, 0] = False
+        return (torch.rand(maskable.shape, device=decoder_tokens.device)
+                < self.decoder_mask_probability) & maskable
+
     def _heads(self, hidden):
         result = {
             "grouped_ioi": self.grouped_ioi_head(hidden),
@@ -356,6 +367,21 @@ class DINRAbsoluteModel(nn.Module):
             decoder_tokens, decoder_attention_mask
         )
         decoder_embeds = self._sum_note_tokens(decoder_tokens, attribute_mask)
+        single_timestep_mask = self._mask_decoder_timestep_single(
+            decoder_tokens, decoder_attention_mask
+        )
+        if single_timestep_mask is not None:
+            pitch_only_tokens = decoder_tokens.new_full(
+                decoder_tokens.shape, DINRTokenSpec.pad_id
+            )
+            pitch_only_tokens[:, :, 0] = decoder_tokens[:, :, 0]
+            pitch_embeds = self._sum_note_tokens(pitch_only_tokens)
+            masked_embeds = pitch_embeds + self.decoder_mask_embedding.to(
+                dtype=decoder_embeds.dtype
+            ).view(1, 1, -1)
+            decoder_embeds = torch.where(
+                single_timestep_mask.unsqueeze(-1), masked_embeds, decoder_embeds
+            )
         if (self.training and self.decoder_mask_mode == "note"
                 and self.decoder_mask_probability > 0.0 and decoder_embeds.shape[1] > 1):
             maskable = decoder_attention_mask.bool().clone()

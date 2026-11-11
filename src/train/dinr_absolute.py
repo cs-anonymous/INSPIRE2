@@ -47,8 +47,10 @@ def main():
     parser.add_argument("--coordinate-frequencies", type=int, default=16)
     parser.add_argument("--decoder-mask-probability", type=float, default=0.0,
                         help="Probability of masking each selected decoder note or attribute.")
-    parser.add_argument("--decoder-mask-mode", choices=["note", "attribute", "timestep"], default="note",
-                        help="Mask full notes, individual attributes, or IOI/velocity/duration together while preserving pitch.")
+    parser.add_argument("--decoder-mask-mode",
+                        choices=["note", "attribute", "timestep", "timestep_single"],
+                        default="note",
+                        help="Mask full notes, individual attributes, or timestep attributes while optionally preserving pitch.")
     parser.add_argument("--separate-ioi-duration-token-tables", action="store_true",
                         help="Use independent categorical embedding tables for IOI and duration.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -170,6 +172,13 @@ def main():
             "coordinate_frequencies": args.coordinate_frequencies,
             "decoder_mask_probability": args.decoder_mask_probability,
             "decoder_mask_mode": args.decoder_mask_mode,
+            "decoder_timestep_mask_vector": (
+                "single learned vector added to retained pitch embedding"
+                if args.decoder_mask_mode == "timestep_single" else None
+            ),
+            "decoder_timestep_mask_vector_init_std": (
+                config.initializer_range if args.decoder_mask_mode == "timestep_single" else None
+            ),
             "decoder_attribute_mask_embeddings": "three slot-specific learned vectors",
             "decoder_attribute_mask_init_std": config.initializer_range,
             "num_input_slots": model.num_input_slots,
