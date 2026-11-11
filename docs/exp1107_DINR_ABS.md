@@ -23,20 +23,20 @@ L_total = L_ioi + L_duration + L_velocity + L_pedal
 
 当前第一阶段只诊断 IOI、duration 和 velocity。设置 `--pedal-mode none` 时，运行时的 score encoder 与 shifted-performance decoder 输入均为 `[B,N,4]`，槽位顺序为 `[pitch, IOI, velocity, duration]`；输出 loss 只包含 grouped/chord IOI、duration、velocity 三项。预计算 sidecar 仍可存 8 槽位，数据集会在取样时裁成 4 槽位。
 
-第一阶段采用**共享 value vocabulary + 属性专属 slot projection**。IOI 与 duration 可使用相同的 500 个 timing value ID，但在求和前分别经过 IOI、duration 的独立投影；因此相同 bin 不会被当成同一属性。pitch 和 velocity 也各自保留槽位投影。decoder 的历史 performance 输入可用 `--decoder-mask-mode attribute --decoder-mask-probability 0.5` 对 IOI、velocity、duration 独立采样 mask；三种属性共用 MASK ID `1`，随后仍经过各自的 slot projection。pitch 不 mask，encoder score 输入不 mask。`--decoder-mask-mode note` 保留旧的整 note mask 行为，整 timestep 的 mask 在 slot-sum 后将完整 note embedding 替换为 learned mask embedding。
+当前 decoder mask 使用三个独立的可学习属性 mask embedding，分别对应 IOI、velocity、duration；以 `initializer_range`（约 0.02）初始化，并在对应槽位的 slot projection 后替换输入 embedding，不使用词表中的 MASK ID `1`。attribute 模式对三个属性独立采样；timestep 模式用一个 Bernoulli 决策同时 mask 三个属性并保留 pitch。validation/test 不 mask。`--decoder-mask-mode note` 保留旧版兼容路径：在 slot-sum 后将整个 note embedding 替换为 learned mask embedding。
 
 三个输入表示方案的取舍：
 
-1. **共享词表、共享 MASK ID、属性专属投影（第一阶段采用）**：参数较少、保留 PT value embedding 初始化，也能显式区分槽位。主要风险是类型区分依赖 slot projection 学出来，因此训练初期相同数值的 IOI/duration 表示相近。
+1. **共享 value vocabulary、属性专属 mask embedding 和 slot projection（当前）**：IOI 与 duration 共用 500 个 timing value ID，但两个属性各自有 slot projection 和独立 mask 向量；mask 不占用普通词表 ID。
 2. **IOI 与 duration 使用独立词表**：类型身份最直接，但会复制 timing embedding 参数，并需要为新表设计 PT 初始化；这会同时改变参数量和初始化条件，适合作为后续消融。
 3. **共享词表后拼接四个槽位，再用 MLP 融合**：槽位身份明确且融合更灵活，但参数和表达能力都会增加，也偏离 slot-sum。当前正研究过拟合来源，不建议把它作为第一阶段基线；若后续测试，应单独作为融合结构消融。
 
-第一阶段的 mask 对照使用相同的 4-slot、无 pedal 模型、held-out-12-work split、PT 初始化、seed 42、global batch 32 和 8 epochs，只改变 decoder 历史输入的 mask 方式：
+早期第一阶段的 mask pilot 使用相同的 4-slot、无 pedal 模型、held-out-12-work split、PT 初始化、seed 42、global batch 32 和 8 epochs，只改变 decoder 历史输入的 mask 方式。attribute 分支曾用普通 MASK ID 1，因该向量尺度异常而不作为当前 attribute 结果；整-note timestep 分支使用专门的 learned mask embedding，作为有效的 legacy timestep 结果保留在统一 HR 表中：
 
 | Run | Mask 方式 | 配置 | 目的 |
 |---|---|---|---|
-| `attribute_random` | 属性级独立随机 mask | 每个历史 timestep 的 IOI、velocity、duration 各以 0.5 概率替换为共享 MASK ID；pitch 不 mask | 检验保留部分属性历史是否足以抑制 teacher-forcing 依赖 |
-| `timestep_random` | 整个 timestep 随机 mask | 每个历史 timestep 以 0.5 概率将完整 4-slot embedding 替换为 learned mask embedding | 与属性级 mask 比较 mask 粒度 |
+| `attribute_random` | 属性级独立随机 mask（旧 pilot） | 每个历史 timestep 的 IOI、velocity、duration 各以 0.5 概率替换为共享 MASK ID 1；pitch 不 mask | ID 1 embedding 尺度异常；不作为当前 attribute 结果 |
+| `timestep_random` | 整个 timestep 随机 mask（旧 pilot） | 每个历史 timestep 以 0.5 概率将完整 4-slot embedding 替换为 learned mask embedding | 有效的 legacy whole-note timestep 结果，列入统一 HR 表 |
 | `no_mask` | 不 mask | mask probability 为 0 | 提供同一新结构与 split 下的无正则对照，判断 mask 是否带来收益 |
 
 三组每个 epoch 都保存 checkpoint，以 `eval_loss` 选择最佳模型，并通过 `save_total_limit=2` 只保留 valid 最佳与最新 epoch 两份 checkpoint；不在输出根目录另存一份模型。每步训练日志、epoch-end validation loss 和模型配置单独保存。训练和验证曲线使用 `trainer_log_history.json` 汇总；每个 epoch 的 train loss 用该 epoch 内 step loss 的均值近似，valid loss 是完整 held-out validation 集的 epoch-end loss。
@@ -53,7 +53,7 @@ bash script/run_dinr_stage1_mask_ablation_3gpu.sh 0 1 2
 
 ### 第一阶段 mask 对比结果
 
-三组于 2026-11-04 在 GPU0/1/2 并行完成 8 epochs。所有设置使用相同的 held-out-12-work 数据、PT 初始化、seed 42、global batch 32；只改变 decoder mask。完整曲线见 [loss_curves.png](../analysis/dinr_stage1_mask_ablation/loss_curves.png)，原始表格见 [losses.csv](../analysis/dinr_stage1_mask_ablation/losses.csv)。Train 值是每 epoch 所有 step-level loss 日志的均值，valid 值是完整 validation 集的 epoch-end loss。
+**以下是第一阶段 mask pilot 的 train/valid 曲线。** 其中整-note `timestep_random` 是有效的 legacy timestep 结果；它会 mask pitch，与后续保留 pitch 的配置不同。该组统一 test HR 与修正后的六组结果见 [EXPERIMENTS_COMPLETE.md](EXPERIMENTS_COMPLETE.md)。曲线仍见 [loss_curves.png](../analysis/dinr_stage1_mask_ablation/loss_curves.png)，原始表格见 [losses.csv](../analysis/dinr_stage1_mask_ablation/losses.csv)。
 
 | Epoch | Attribute train | Attribute valid | Timestep train | Timestep valid | No-mask train | No-mask valid |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -74,7 +74,7 @@ bash script/run_dinr_stage1_mask_ablation_3gpu.sh 0 1 2
 
 在这次单 seed 对照中，no-mask 训练 loss 下降最快，但 valid loss 从 ep4 起持续回升，符合明显过拟合；属性级和整 timestep mask 都显著减小 ep8 相对各自最佳 valid 的回升。整 timestep mask 的最低 valid 比属性级 mask 低 0.535，ep8 也低 0.503；属性级组则在 ep7 才达到最低点。no-mask 的 ep4 最低 valid 仍略低于两个 mask 组，但继续训练会快速恶化，因此早停 epoch 的选择很重要。
 
-三种配置可用相同 loss 作横向参考，但 mask 保留的信息量不同：属性级 mask 总是保留 decoder pitch，并平均保留 1.5/3 个 performance 属性；整 timestep mask 会一并遮掉 pitch 和全部 performance 属性；no-mask 保留所有历史输入。因此当前结果支持“decoder feedback masking 能抑制后期过拟合”，但还不能归结为纯 mask 粒度的因果差异，也不能据单 seed 宣称性能差异具有统计显著性。暂未做 test MIDI 指标评估；本轮目的是比较 train/valid 轨迹。
+三种配置可用相同 loss 作横向参考，但 mask 保留的信息量不同：属性级 mask 总是保留 decoder pitch，并平均保留 1.5/3 个 performance 属性；整 timestep mask 会一并遮掉 pitch 和全部 performance 属性；no-mask 保留所有历史输入。整-note timestep 结果已用 best-valid checkpoint 完成统一 test MIDI 评估并列入总表；它与 retain-pitch 实验不是只改变 pitch mask 的严格单变量对照。单 seed 结果不能说明性能差异具有统计显著性。
 
 保存策略为每 epoch checkpoint、`eval_loss` 选 best、`save_total_limit=2` 保留 best 与 latest。完成后的 checkpoint 为：attribute `checkpoint-2254`（best ep7）与 `checkpoint-2576`（last ep8）；timestep `checkpoint-1932`（best ep6）与 `checkpoint-2576`（last ep8）；no-mask `checkpoint-1288`（best ep4）与 `checkpoint-2576`（last ep8）。输出根目录不另存重复模型权重。
 
