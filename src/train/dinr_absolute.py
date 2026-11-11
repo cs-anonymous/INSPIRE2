@@ -42,6 +42,30 @@ def main():
     parser.add_argument("--precomputed-valid", type=Path, default=None)
     parser.add_argument("--eval-split", choices=["none", "train", "valid", "test"], default="none")
     parser.add_argument("--pedal-mode", choices=["ce", "bce", "none"], default="ce")
+    parser.add_argument("--numerical-coordinates", action="store_true",
+                        help="Add Fourier numerical coordinates to timing/velocity token embeddings.")
+    parser.add_argument("--coordinate-frequencies", type=int, default=16)
+    parser.add_argument("--decoder-mask-probability", type=float, default=0.0,
+                        help="Probability of masking each selected decoder note or attribute.")
+    parser.add_argument("--decoder-mask-mode", choices=["note", "attribute", "timestep"], default="note",
+                        help="Mask full notes, individual attributes, or IOI/velocity/duration together while preserving pitch.")
+    parser.add_argument("--separate-ioi-duration-token-tables", action="store_true",
+                        help="Use independent categorical embedding tables for IOI and duration.")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--lr-scheduler-type", choices=["linear", "cosine"], default="linear")
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--timing-target-mode", choices=["absolute", "log_absolute", "score_relative_log"], default="absolute")
+    parser.add_argument("--time-input-mode", choices=["linear", "log_absolute"], default="linear",
+                        help="Encoding for timing values supplied to the encoder and shifted decoder inputs.")
+    parser.add_argument("--no-checkpointing", action="store_true",
+                        help="Disable checkpoint and final model writes for diagnostic runs.")
+    parser.add_argument("--load-best-model-at-end", action="store_true",
+                        help="Restore the lowest-eval-loss checkpoint after training.")
+    parser.add_argument("--save-total-limit", type=int, default=None,
+                        help="Maximum number of epoch checkpoints to retain.")
+    parser.add_argument("--skip-final-model-save", action="store_true",
+                        help="Keep epoch checkpoints without writing a duplicate model at output root.")
     args = parser.parse_args()
     set_seed(args.seed)
 
@@ -50,6 +74,8 @@ def main():
         max_performances=args.max_train_performances,
         include_pedal=args.pedal_mode != "none",
         precomputed_path=args.precomputed_train,
+        timing_target_mode=args.timing_target_mode,
+        time_input_mode=args.time_input_mode,
     )
     valid = None
     if args.eval_split != "none":
@@ -58,7 +84,11 @@ def main():
             max_performances=args.max_valid_performances,
             include_pedal=args.pedal_mode != "none",
             precomputed_path=args.precomputed_valid,
+            timing_target_mode=args.timing_target_mode,
+            time_input_mode=args.time_input_mode,
         )
+    if args.load_best_model_at_end and valid is None:
+        raise ValueError("--load-best-model-at-end requires --eval-split valid|train|test")
     if args.limit_train:
         train.samples = train.samples[: args.limit_train]
     if valid is not None and args.limit_valid:
@@ -74,7 +104,17 @@ def main():
         head_dim=args.head_dim,
         torch_dtype=torch.bfloat16,
     )
-    model = DINRAbsoluteModel(config, pedal_mode=args.pedal_mode)
+    model = DINRAbsoluteModel(
+        config,
+        pedal_mode=args.pedal_mode,
+        numerical_coordinates=args.numerical_coordinates,
+        coordinate_frequencies=args.coordinate_frequencies,
+        decoder_mask_probability=args.decoder_mask_probability,
+        decoder_mask_mode=args.decoder_mask_mode,
+        separate_ioi_duration_tables=args.separate_ioi_duration_token_tables,
+        timing_target_mode=args.timing_target_mode,
+        time_input_mode=args.time_input_mode,
+    )
     if args.pretrained_pt:
         print("PT initialization:", model.initialize_from_pt(args.pretrained_pt))
     training_args = TrainingArguments(
@@ -83,11 +123,19 @@ def main():
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
+        weight_decay=args.weight_decay,
         seed=args.seed,
         data_seed=args.seed,
         eval_strategy="epoch" if valid is not None else "no",
-        save_strategy="epoch",
+        save_strategy="no" if args.no_checkpointing else "epoch",
+        save_total_limit=args.save_total_limit,
+        load_best_model_at_end=args.load_best_model_at_end,
+        metric_for_best_model="eval_loss" if args.load_best_model_at_end else None,
+        greater_is_better=False if args.load_best_model_at_end else None,
         logging_strategy="steps",
         logging_steps=10,
         bf16=torch.cuda.is_available(),
@@ -103,13 +151,35 @@ def main():
         data_collator=DINRCollator(),
     )
     trainer.train()
-    trainer.save_model(str(args.output_dir))
+    if not args.no_checkpointing and not args.skip_final_model_save:
+        trainer.save_model(str(args.output_dir))
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "trainer_log_history.json").write_text(
+        json.dumps(trainer.state.log_history, indent=2), encoding="utf-8"
+    )
     config.save_pretrained(args.output_dir)
     (args.output_dir / "dinr_config.json").write_text(
         json.dumps({
             "model_type": "dinr_absolute",
+            "timing_target_mode": args.timing_target_mode,
+            "time_input_mode": args.time_input_mode,
             "pedal_mode": args.pedal_mode,
+            "slot_conditioned_value_embeddings": True,
+            "separate_ioi_duration_token_tables": args.separate_ioi_duration_token_tables,
+            "numerical_coordinates": args.numerical_coordinates,
+            "coordinate_frequencies": args.coordinate_frequencies,
+            "decoder_mask_probability": args.decoder_mask_probability,
+            "decoder_mask_mode": args.decoder_mask_mode,
+            "decoder_attribute_mask_embeddings": "three slot-specific learned vectors",
+            "decoder_attribute_mask_init_std": config.initializer_range,
+            "num_input_slots": model.num_input_slots,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "lr_scheduler_type": args.lr_scheduler_type,
+            "warmup_steps": args.warmup_steps,
+            "weight_decay": args.weight_decay,
+            "save_total_limit": args.save_total_limit,
+            "load_best_model_at_end": args.load_best_model_at_end,
+            "skip_final_model_save": args.skip_final_model_save,
             "vocab_size": 763,
             "token_ranges": {
                 "special": {"pad": 0, "bos": 2},
@@ -121,6 +191,8 @@ def main():
             "timing_bins": 500,
             "timing_bin_ms": 10,
             "max_timing_ms": 5000,
+            "log_time_transform": "ln(1+ms), scaled to [0,9], then quantized to 500 bins",
+            "log_deviation_ranges": {"score_ioi_positive": [-3.0, 2.0], "score_ioi_zero": [0.0, 5.0], "duration": [-3.0, 2.0]},
             "sidecar": "score_ASAP_refined.ASAP_GROUPED_MEDIAN.pt",
             "use_pretrained_pt": bool(args.pretrained_pt),
             "pretrained_pt": args.pretrained_pt,

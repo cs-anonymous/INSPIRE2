@@ -21,6 +21,7 @@ class DINRTokenSpec:
 
     pad_id = 0
     bos_id = 2
+    mask_id = 1
     pitch_start = 5
     pitch_bins = 128
     velocity_bins = 128
@@ -45,17 +46,32 @@ class DINRTokenSpec:
         ]
 
     @classmethod
+    def log_time_bin(cls, milliseconds):
+        """Map log1p(milliseconds) from [0, 5000] ms to 500 categorical bins."""
+        import math
+        value = min(max(float(milliseconds), 0.0), float(cls.max_timing_ms))
+        unit = math.log1p(value) / math.log1p(cls.max_timing_ms)
+        return int(round(unit * (cls.timing_bins - 1)))
+
+    @classmethod
+    def log_time_ms(cls, category):
+        import math
+        unit = min(max(int(category), 0), cls.timing_bins - 1) / (cls.timing_bins - 1)
+        return math.expm1(unit * math.log1p(cls.max_timing_ms))
+
+    @classmethod
     def tokens_to_local_targets(cls, tokens):
         tokens = torch.as_tensor(tokens, dtype=torch.long)
-        return torch.stack(
-            [
-                tokens[..., 1] - cls.timing_start,
-                tokens[..., 3] - cls.timing_start,
-                tokens[..., 2] - cls.velocity_start,
-                *(tokens[..., index] - cls.pedal_start for index in range(4, 8)),
-            ],
-            dim=-1,
-        )
+        if tokens.shape[-1] not in (4, 8):
+            raise ValueError(f"Expected 4 or 8 note slots, got {tokens.shape[-1]}")
+        targets = [
+            tokens[..., 1] - cls.timing_start,
+            tokens[..., 3] - cls.timing_start,
+            tokens[..., 2] - cls.velocity_start,
+        ]
+        if tokens.shape[-1] == 8:
+            targets.extend(tokens[..., index] - cls.pedal_start for index in range(4, 8))
+        return torch.stack(targets, dim=-1)
 
 
 def _sidecar_paths(root: Path) -> list[Path]:
@@ -101,7 +117,7 @@ def _performance_tokens(score, performance, include_pedal=True):
             score_pitch[index], s_ioi, s_dur, s_vel, [0, 0, 0, 0]
         )
         if not include_pedal:
-            score_note[4:] = [DINRTokenSpec.pad_id] * 4
+            score_note = score_note[:4]
         score_tokens.append(score_note)
         score_zero_ioi.append(s_ioi <= 0.0)
         pedals = [1 if float(value) >= 64.0 else 0 for value in pedal_rows[index][:4]]
@@ -109,7 +125,7 @@ def _performance_tokens(score, performance, include_pedal=True):
             score_pitch[index], target_ioi, p_dur, p_vel, pedals
         )
         if not include_pedal:
-            target_note[4:] = [DINRTokenSpec.pad_id] * 4
+            target_note = target_note[:4]
         target_tokens.append(target_note)
     return score_tokens, target_tokens, score_zero_ioi
 
@@ -119,12 +135,18 @@ class DINRAbsoluteDataset(Dataset):
 
     def __init__(self, sidecar_root, split="train", block_notes=512, overlap_ratio=0.5,
                  max_sidecars=None, max_performances=None, include_pedal=True,
-                 precomputed_path=None):
+                 precomputed_path=None, timing_target_mode="absolute", time_input_mode="linear"):
         self.root = Path(sidecar_root).resolve()
         self.split = str(split)
         self.block_notes = int(block_notes)
         self.overlap_ratio = float(overlap_ratio)
         self.include_pedal = bool(include_pedal)
+        self.timing_target_mode = str(timing_target_mode).lower()
+        if self.timing_target_mode not in {"absolute", "log_absolute", "score_relative_log"}:
+            raise ValueError("timing_target_mode must be absolute, log_absolute, or score_relative_log")
+        self.time_input_mode = str(time_input_mode).lower()
+        if self.time_input_mode not in {"linear", "log_absolute"}:
+            raise ValueError("time_input_mode must be linear or log_absolute")
         self.precomputed = None
         self._sidecar_cache = OrderedDict()
         self._token_cache = OrderedDict()
@@ -184,18 +206,73 @@ class DINRAbsoluteDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    @staticmethod
+    def _quantize_unit_interval(value, low, high, bins):
+        value = torch.as_tensor(value, dtype=torch.float32).clamp(low, high)
+        return torch.round((value - low) * ((bins - 1) / (high - low))).long()
+
+    def _encode_relative_targets(self, score_tokens, target_tokens, zero_mask):
+        """Replace absolute timing labels with score-relative log categories."""
+        if self.timing_target_mode == "absolute":
+            return target_tokens
+        timing_start = DINRTokenSpec.timing_start
+        score_ioi_ms = (score_tokens[:, 1] - timing_start).clamp_min(0).float() * DINRTokenSpec.timing_bin_ms
+        target_ioi_ms = (target_tokens[:, 1] - timing_start).clamp_min(0).float() * DINRTokenSpec.timing_bin_ms
+        score_duration_ms = (score_tokens[:, 3] - timing_start).clamp_min(0).float() * DINRTokenSpec.timing_bin_ms
+        target_duration_ms = (target_tokens[:, 3] - timing_start).clamp_min(0).float() * DINRTokenSpec.timing_bin_ms
+
+        ioi_log = torch.log(target_ioi_ms.clamp_min(1.0))
+        ioi_relative = ioi_log - torch.log(score_ioi_ms.clamp_min(1.0))
+        positive_ioi_bins = self._quantize_unit_interval(ioi_relative, -3.0, 2.0, DINRTokenSpec.timing_bins)
+        chord_ioi_bins = self._quantize_unit_interval(ioi_log, 0.0, 5.0, DINRTokenSpec.timing_bins)
+        if self.timing_target_mode == "log_absolute":
+            encoded = target_tokens.clone()
+            encoded[:, 1] = timing_start + torch.tensor(
+                [DINRTokenSpec.log_time_bin(x) for x in target_ioi_ms.tolist()], dtype=torch.long
+            )
+            encoded[:, 3] = timing_start + torch.tensor(
+                [DINRTokenSpec.log_time_bin(x) for x in target_duration_ms.tolist()], dtype=torch.long
+            )
+            return encoded
+        duration_relative = torch.log(target_duration_ms.clamp_min(1.0)) - torch.log(score_duration_ms.clamp_min(1.0))
+        duration_bins = self._quantize_unit_interval(duration_relative, -3.0, 2.0, DINRTokenSpec.timing_bins)
+
+        encoded = target_tokens.clone()
+        encoded[:, 1] = timing_start + torch.where(zero_mask.bool(), chord_ioi_bins, positive_ioi_bins)
+        encoded[:, 3] = timing_start + duration_bins
+        return encoded
+
+    @staticmethod
+    def _encode_input_times(tokens, mode):
+        if mode == "linear":
+            return tokens
+        result = tokens.clone()
+        start = DINRTokenSpec.timing_start
+        for slot in (1, 3):
+            ms = (tokens[:, slot] - start).clamp_min(0).float() * DINRTokenSpec.timing_bin_ms
+            bins = torch.tensor([DINRTokenSpec.log_time_bin(x) for x in ms.tolist()], dtype=torch.long)
+            result[:, slot] = start + bins
+        return result
+
     def __getitem__(self, index):
         if self.precomputed is not None:
             start, end = self.samples[index]
-            score = self.precomputed["score_tokens"][start:end].long()
-            targets = self.precomputed["target_tokens"][start:end].long()
+            score = self.precomputed["score_tokens"][start:end].long().clone()
+            targets = self.precomputed["target_tokens"][start:end].long().clone()
             zero_mask = self.precomputed["score_zero_ioi_mask"][start:end]
             if not self.include_pedal:
-                score[:, 4:] = DINRTokenSpec.pad_id
-                targets[:, 4:] = DINRTokenSpec.pad_id
+                score = score[:, :4]
+                targets = targets[:, :4]
+            decoder_source = targets.clone()
+            targets = self._encode_relative_targets(score, targets, zero_mask)
+            score = self._encode_input_times(score, self.time_input_mode)
+            if self.timing_target_mode == "score_relative_log":
+                decoder_source = self._encode_input_times(decoder_source, "log_absolute")
+            else:
+                decoder_source = targets
             decoder_tokens = torch.full_like(targets, DINRTokenSpec.bos_id)
             if len(targets) > 1:
-                decoder_tokens[1:] = targets[:-1]
+                decoder_tokens[1:] = decoder_source[:-1]
             labels = DINRTokenSpec.tokens_to_local_targets(targets)
             if not self.include_pedal:
                 labels[..., 3:] = -100
@@ -226,9 +303,18 @@ class DINRAbsoluteDataset(Dataset):
             self._token_cache.move_to_end(cache_key)
         score_tokens, target_tokens, score_zero_ioi = self._token_cache[cache_key]
         score = torch.tensor(score_tokens[start:end], dtype=torch.long)
-        target_tokens = target_tokens[start:end]
-        decoder_tokens = [[DINRTokenSpec.bos_id] * 8]
-        decoder_tokens.extend(target_tokens[:-1])
+        target_tokens = torch.tensor(target_tokens[start:end], dtype=torch.long)
+        zero_mask = torch.tensor(score_zero_ioi[start:end], dtype=torch.bool)
+        decoder_source = target_tokens.clone()
+        target_tokens = self._encode_relative_targets(score, target_tokens, zero_mask)
+        score = self._encode_input_times(score, self.time_input_mode)
+        if self.timing_target_mode == "score_relative_log":
+            decoder_source = self._encode_input_times(decoder_source, "log_absolute")
+        else:
+            decoder_source = target_tokens
+        slot_count = len(target_tokens[0]) if target_tokens else 4
+        decoder_tokens = [[DINRTokenSpec.bos_id] * slot_count]
+        decoder_tokens.extend(decoder_source[:-1].tolist())
         decoder = torch.tensor(decoder_tokens, dtype=torch.long)
         target = DINRTokenSpec.tokens_to_local_targets(target_tokens)
         if not self.include_pedal:
@@ -237,7 +323,7 @@ class DINRAbsoluteDataset(Dataset):
             "score_tokens": score,
             "decoder_tokens": decoder,
             "labels": target,
-            "score_zero_ioi_mask": torch.tensor(score_zero_ioi[start:end], dtype=torch.bool),
+            "score_zero_ioi_mask": zero_mask,
             "attention_mask": torch.ones(score.shape[0], dtype=torch.long),
         }
 
@@ -246,9 +332,11 @@ class DINRCollator:
     def __call__(self, examples):
         max_notes = max(example["score_tokens"].shape[0] for example in examples)
         batch_size = len(examples)
-        score = torch.full((batch_size, max_notes, 8), DINRTokenSpec.pad_id, dtype=torch.long)
+        slot_count = examples[0]["score_tokens"].shape[-1]
+        label_count = examples[0]["labels"].shape[-1]
+        score = torch.full((batch_size, max_notes, slot_count), DINRTokenSpec.pad_id, dtype=torch.long)
         decoder = torch.full_like(score, DINRTokenSpec.pad_id)
-        labels = torch.full((batch_size, max_notes, 7), -100, dtype=torch.long)
+        labels = torch.full((batch_size, max_notes, label_count), -100, dtype=torch.long)
         zero_ioi = torch.zeros((batch_size, max_notes), dtype=torch.bool)
         mask = torch.zeros((batch_size, max_notes), dtype=torch.long)
         for row, example in enumerate(examples):

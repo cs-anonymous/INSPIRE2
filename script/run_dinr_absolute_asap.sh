@@ -28,5 +28,6 @@ CUDA_VISIBLE_DEVICES="$gpu" python -u -m src.train.dinr_absolute \
 CUDA_VISIBLE_DEVICES="$gpu" python -u -m src.evaluate.evaluate_dinr_absolute \
   --checkpoint "$output_dir" \
   --sidecar-root ../data/ASAP_processed \
-  --output-dir "$output_dir/test_eval" \
-  --pedal-mode "$mode" --device cuda:0
+  --output-dir "$output_dir/test_eval_sampling_w8_s3" \
+  --pedal-mode "$mode" --device cuda:0 \
+  --num-workers 8 --num-samples 3 --temperature 1.0 --top-p 0.9 --seed 42

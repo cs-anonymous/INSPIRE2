@@ -1,0 +1,96 @@
+{
+  "name": "asap_train_valid_heldout_12works_v1",
+  "description": "Fixed work-level validation split for DINR diagnostics. All canonical windows from these works are held out from train.",
+  "sidecar": "score_ASAP_refined.ASAP_GROUPED_MEDIAN.pt",
+  "window_notes": 512,
+  "window_overlap_ratio": 0.5,
+  "expected_train_windows": 10280,
+  "expected_valid_windows": 507,
+  "test_split": "unchanged existing work-disjoint split (17 works)",
+  "valid_work_paths": [
+    {
+      "composer": "Beethoven,_Ludwig_van",
+      "style_group": "Classical",
+      "train_performances": 3,
+      "canonical_windows": 45,
+      "work_path": "Beethoven,_Ludwig_van/Piano_Sonata_No.15_in_D_major,_Op.28_(\"Pastoral\")/1._Allegro"
+    },
+    {
+      "composer": "Beethoven,_Ludwig_van",
+      "style_group": "Classical",
+      "train_performances": 4,
+      "canonical_windows": 60,
+      "work_path": "Beethoven,_Ludwig_van/Piano_Sonata_No.17_in_D_minor,_Op.31_No.2_(\"The_Tempest\")/1._Largo_-_Allegro"
+    },
+    {
+      "composer": "Chopin,_Frédéric",
+      "style_group": "Romantic",
+      "train_performances": 3,
+      "canonical_windows": 51,
+      "work_path": "Chopin,_Frédéric/Ballade_No.3_in_A_flat_major,_Op.47"
+    },
+    {
+      "composer": "Chopin,_Frédéric",
+      "style_group": "Romantic",
+      "train_performances": 10,
+      "canonical_windows": 60,
+      "work_path": "Chopin,_Frédéric/12_Études,_Op.10/No.5_in_G_flat_major_\"Black_Keys\""
+    },
+    {
+      "composer": "Haydn,_Joseph",
+      "style_group": "Classical",
+      "train_performances": 3,
+      "canonical_windows": 30,
+      "work_path": "Haydn,_Joseph/Piano_Sonata_No.59,_Keyboard_Sonata_in_E_flat_major,_Hob.XVI:49/1._Allegro_(E_flat_major)"
+    },
+    {
+      "composer": "Liszt,_Franz",
+      "style_group": "Romantic",
+      "train_performances": 4,
+      "canonical_windows": 48,
+      "work_path": "Liszt,_Franz/2_Etudes_de_Concert,_S.145/2._Gnomenreigen"
+    },
+    {
+      "composer": "Mozart,_Wolfgang_Amadeus",
+      "style_group": "Classical",
+      "train_performances": 3,
+      "canonical_windows": 33,
+      "work_path": "Mozart,_Wolfgang_Amadeus/Piano_Sonata_No.12_in_F_major,_K.332/3._Allegro_assai"
+    },
+    {
+      "composer": "Debussy,_Claude",
+      "style_group": "Impressionist",
+      "train_performances": 2,
+      "canonical_windows": 14,
+      "work_path": "Debussy,_Claude/Images,_Book_1,_L.110/1._Reflets_dans_l'eau"
+    },
+    {
+      "composer": "Bach,_Johann_Sebastian",
+      "style_group": "Baroque",
+      "train_performances": 6,
+      "canonical_windows": 36,
+      "work_path": "Bach,_Johann_Sebastian/The_Well-Tempered_Clavier,_Book_I,_BWV_846-869/No.15_in_G_major,_BWV_860:_Fugue"
+    },
+    {
+      "composer": "Ravel,_Maurice",
+      "style_group": "Impressionist",
+      "train_performances": 3,
+      "canonical_windows": 54,
+      "work_path": "Ravel,_Maurice/Miroirs,_M.43/3._Une_barque_sur_l'océan"
+    },
+    {
+      "composer": "Schubert,_Franz",
+      "style_group": "Early Romantic",
+      "train_performances": 4,
+      "canonical_windows": 56,
+      "work_path": "Schubert,_Franz/4_Impromptus,_Op.90,_D.899/1._Allegro_molto_moderato"
+    },
+    {
+      "composer": "Rachmaninoff,_Sergei",
+      "style_group": "Late Romantic",
+      "train_performances": 2,
+      "canonical_windows": 20,
+      "work_path": "Rachmaninoff,_Sergei/13_Preludes,_Op.32/No.10_in_B_minor:_Lento"
+    }
+  ]
+}
