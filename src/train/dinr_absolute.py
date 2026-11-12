@@ -7,12 +7,15 @@ import json
 from pathlib import Path
 
 import torch
-from transformers import Trainer, TrainingArguments
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 from transformers import set_seed
 
 from src.data_process.dinr_dataset import DINRCollator, DINRAbsoluteDataset
 from src.model.dinr import DINRAbsoluteModel
 from src.model.pianoformer import PianoT5GemmaConfig
+from src.train.halfepoch_protocol import (
+    BestOnlyTrainer, HalfEpochValidationCallback, LiveLossHistoryCallback,
+)
 
 
 def main():
@@ -68,7 +71,19 @@ def main():
                         help="Maximum number of epoch checkpoints to retain.")
     parser.add_argument("--skip-final-model-save", action="store_true",
                         help="Keep epoch checkpoints without writing a duplicate model at output root.")
+    parser.add_argument("--half-epoch-validation", action="store_true")
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--best-only-checkpoints", action="store_true")
+    parser.add_argument("--logging-steps", type=int, default=10)
     args = parser.parse_args()
+    if args.half_epoch_validation and args.eval_split == "none":
+        parser.error("--half-epoch-validation requires a validation split")
+    if args.early_stopping_patience and not args.load_best_model_at_end:
+        parser.error("Early stopping requires --load-best-model-at-end")
+    if args.best_only_checkpoints and (
+        not args.load_best_model_at_end or args.no_checkpointing or not args.skip_final_model_save
+    ):
+        parser.error("Best-only checkpoints require best-model loading, checkpointing, and no duplicate final save")
     set_seed(args.seed)
 
     train = DINRAbsoluteDataset(
@@ -134,23 +149,32 @@ def main():
         data_seed=args.seed,
         eval_strategy="epoch" if valid is not None else "no",
         save_strategy="no" if args.no_checkpointing else "epoch",
-        save_total_limit=args.save_total_limit,
+        save_total_limit=1 if args.best_only_checkpoints else args.save_total_limit,
+        save_only_model=args.best_only_checkpoints,
         load_best_model_at_end=args.load_best_model_at_end,
         metric_for_best_model="eval_loss" if args.load_best_model_at_end else None,
         greater_is_better=False if args.load_best_model_at_end else None,
         logging_strategy="steps",
-        logging_steps=10,
+        logging_steps=args.logging_steps,
+        logging_first_step=True,
         bf16=torch.cuda.is_available(),
         report_to="none",
         prediction_loss_only=True,
         remove_unused_columns=False,
     )
-    trainer = Trainer(
+    callbacks = [LiveLossHistoryCallback()]
+    if args.half_epoch_validation:
+        callbacks.append(HalfEpochValidationCallback())
+    if args.early_stopping_patience:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
+    trainer_class = BestOnlyTrainer if args.best_only_checkpoints else Trainer
+    trainer = trainer_class(
         model=model,
         args=training_args,
         train_dataset=train,
         eval_dataset=valid,
         data_collator=DINRCollator(),
+        callbacks=callbacks,
     )
     trainer.train()
     if not args.no_checkpointing and not args.skip_final_model_save:
@@ -189,6 +213,10 @@ def main():
             "save_total_limit": args.save_total_limit,
             "load_best_model_at_end": args.load_best_model_at_end,
             "skip_final_model_save": args.skip_final_model_save,
+            "half_epoch_validation": args.half_epoch_validation,
+            "early_stopping_patience": args.early_stopping_patience,
+            "best_only_checkpoints": args.best_only_checkpoints,
+            "logging_steps": args.logging_steps,
             "vocab_size": 763,
             "token_ranges": {
                 "special": {"pad": 0, "bos": 2},

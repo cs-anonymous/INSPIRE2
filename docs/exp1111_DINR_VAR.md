@@ -1,5 +1,7 @@
 # INSPIRE2 / PianistTransformer 实验总览
 
+第 7 节记录了最新的半 epoch validation / early stopping 重跑结果。上一轮协议和结果仍保留用于历史对照。
+
 本文记录当前 INSPIRE2 实验线的统一设置、训练曲线、checkpoint 选择、test 采样评估和最终结论。所有实验的 loss 都只能在相同目标、属性和数据划分内比较；PT 的 token-level CE 与 DINR 的属性级 loss 不具有直接可比的绝对数值。
 
 ## 1. 数据与评估协议
@@ -160,7 +162,56 @@ Validation loss 单独看并不能决定最终配置：它偏好 shared no-mask�
 4. **最佳 checkpoint 不是最后一个 epoch。** 六组修正实验加本次 follow-up 的最佳 valid epoch 为 4 或 5；旧版 timestep 分别为 epoch 7 和 6；两个 no-mask 组分别是 epoch 4（shared）和 epoch 3（separate）。应按无 mask validation loss 选 checkpoint。
 5. **PT base-1 的 PN HR 低于 PT scratch（1.8078 vs. 8.8233）。** PT scratch 行采用本次最多 8 epoch、连续 3 次 valid 上升早停的完整 run，best 是 epoch 2；两行均使用同一 DINR HR 函数重算，PT 原始评估脚本的配对汇总不用于此表。
 
-## 7. 结果文件索引
+## 7. 半 epoch validation / early stopping 重跑
+
+本轮重新运行除 `timestep 3+pitch` 外的全部 12 个配置：PT 2 组、DINR attribute 2 组、DINR timestep 2 组、DINR none 2 组、DINR `timestep 1+pitch` 4 组。`timestep 3+pitch` 本轮不重跑，Section 5 中的对应数值仍是历史结果。
+
+训练规则统一为：最多 8 epoch；每个 epoch 在中点和结束时各验证一次，中点不能整除 optimizer step 时使用其后的第一个 step；valid loss 严格低于历史最低值才算改善，持平也计为未改善；连续 4 次未改善即早停。只保存最低 valid loss 对应的 checkpoint，每个实验最终只保留一个最佳 checkpoint，不保存 optimizer state。Train loss 每个 optimizer step 记录一次，valid loss 保留每 epoch 两次的全部点。
+
+沿用 held-out-12-work split、seed 42 和 effective batch 32。DINR 使用单卡 batch 32、学习率 `3e-4` 和 linear decay；PT 使用单卡 batch 2 × gradient accumulation 16、学习率 `5e-4` 和 cosine decay。PT 上一轮的双卡 batch 2 × accumulation 8 改为单卡队列，effective batch 仍为 32。DINR timestep 使用当前代码的整 note mask（`decoder_mask_mode=note`），timestep 1+pitch 使用 `timestep_single`。
+
+本轮所有配置均完成 19 首 test work × 2 samples（38 个生成）。HR 使用本文件第 1 节定义的逐 note-index Wasserstein 口径。新的训练、valid 曲线、最佳 checkpoint、停止 epoch 和 HR 汇总位于 [`epx1111_halfepoch`](../analysis/epx1111_halfepoch/)。五列两行总图中，五列依次为 PT、DINR attribute、DINR timestep、DINR none、DINR `timestep 1+pitch`；第一行是逐 optimizer step 的 train loss，第二行是每半个 epoch 的 valid loss。
+
+![五组 train/valid 曲线，五列两行](../analysis/epx1111_halfepoch/all_groups.png)
+
+[总图 PDF](../analysis/epx1111_halfepoch/all_groups.pdf) · [本轮结果 CSV（含 checkpoint 路径）](../analysis/epx1111_halfepoch/all_experiments.csv) · [原始 train/valid loss CSV](../analysis/epx1111_halfepoch/all_losses.csv)
+
+| method | 训练mask | time表示 | Best valid point | Best valid loss | Stop epoch | IOI HR | Dur HR | Vel HR | PN HR |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| PT base-1 | non-pitch token | abs 5000 token | 1.0 | 1.628303 | 3.0 | 2.0598 | 2.0549 | 1.6014 | **1.9053** |
+| PT scratch | non-pitch token | abs 5000 token | 1.0 | 3.045935 | 3.0 | 10.2280 | 82.9304 | 3.6032 | **32.2539** |
+| DINR separate | attribute | abs 500 token | 5.0 | 10.556693 | 7.0 | 3.8375 | 2.3808 | 1.6076 | **2.6086** |
+| DINR shared | attribute | abs 500 token | 4.5 | 10.507156 | 6.5 | 3.9974 | 2.9456 | 1.9862 | **2.9764** |
+| DINR separate | timestep | abs 500 token | 6.0 | 10.642722 | 8.0 | 3.5809 | 2.4194 | 2.1074 | **2.7026** |
+| DINR shared | timestep | abs 500 token | 6.0 | 10.582067 | 8.0 | 3.8383 | 2.6406 | 2.2459 | **2.9082** |
+| DINR separate | none | abs 500 token | 3.0 | 10.949567 | 5.0 | 3.5455 | 2.2517 | 2.5002 | **2.7658** |
+| DINR shared | none | abs 500 token | 4.0 | 10.665311 | 6.0 | 3.0398 | 2.2748 | 2.9645 | **2.7597** |
+| DINR separate | timestep 1+pitch | abs 500 token | 4.5 | 10.454540 | 6.5 | 2.4867 | 2.1589 | 1.3977 | **2.0144** |
+| DINR shared | timestep 1+pitch | abs 500 token | 4.0 | 10.437893 | 6.0 | 2.9933 | 2.2065 | 1.9703 | **2.3900** |
+| DINR separate | timestep 1+pitch | log abs | 4.0 | 10.375171 | 6.0 | 2.9767 | 2.3997 | 2.3087 | **2.5617** |
+| DINR separate | timestep 1+pitch | log dev | 6.0 | 11.280642 | 8.0 | 2.2263 | 2.3196 | 1.5526 | **2.0328** |
+
+在这轮重跑中，DINR 的最低 PN HR 是 `timestep 1+pitch` 的 separate + abs 500 token，PN HR **2.0144**；PT base-1 的 PN HR 为 **1.9053**。PT scratch 的 duration HR 明显偏高，PN HR 为 **32.2539**。这些数值只与本轮相同协议下的结果直接比较，不能与 Section 5 中不同训练/验证协议的数值混为一谈。
+
+<!-- PT_SCRATCH_FULL8_BEGIN -->
+### 7.1 PT scratch：关闭早停，双卡完整训练 8 epoch
+
+状态：**双卡训练中**。仅 PT scratch 重新从随机初始化训练；使用 GPU0、GPU1 的 DDP，每卡 batch 2 × gradient accumulation 8，全局 batch 32。关闭 early stopping，固定训练 8 epoch；每半个 epoch 验证一次，共 16 次，仍只保留 valid loss 最低的 checkpoint。学习率 `5e-4`、cosine decay、seed 42 和 held-out split 沿用本轮设置。
+
+旧 scratch 在 epoch 1 的 valid loss 为 3.045935；epoch 2、2.5、3 分别为 3.307507、3.224152、3.075577，最后两次正在下降但未超过历史最佳，因此触发 patience 4。完整 8 epoch 实验用来检查后续能否再次改善。上方原 12 项表格保留早停实验结果；五列两行图的 PT 列同时显示早停版与完整 8 epoch 版。
+
+已记录 validation：0/16。
+
+| method | Best valid epoch | Best valid loss | Final epoch | IOI HR | Dur HR | Vel HR | PN HR |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PT scratch full 8ep | — | — | — | — | — | — | — |
+
+训练后自动选择最佳 valid checkpoint，使用双卡、每卡 4 workers 完成 19 首 × 2 samples；temperature 1.0、top-p 0.95、seed 42，按相同 DINR note-index W1 和 human anchors 计算分项 HR。
+
+运行产物：[`pt_scratch_halfepoch_full8_2gpu`](../../results/pt_scratch_halfepoch_full8_2gpu/)，包括 `config.json`、`status.json`、`train.log`、完整 loss 历史、最佳 checkpoint、测试 MIDI 和 `hr.json`。
+<!-- PT_SCRATCH_FULL8_END -->
+
+## 8. 结果文件索引
 
 - 修正后的 DINR mask 实验：`INSPIRE2/models/dinr_mask_revised_heldout12_8ep/`
 - 全部模型统一 HR：`INSPIRE2/analysis/dinr_six_model_hr_comparison/`
