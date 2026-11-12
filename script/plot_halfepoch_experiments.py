@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import json
 from pathlib import Path
 
@@ -50,6 +51,13 @@ def write_csv(path, rows, fields):
 
 def draw(axes, jobs, histories, group):
     colors = plt.get_cmap("tab10")
+    observed_epochs = [
+        float(row["epoch"])
+        for job in jobs for row in histories[job["id"]]
+        if "epoch" in row
+    ]
+    max_epoch = max(8, int(max(observed_epochs, default=8) + 0.999999))
+    tick_step = 1 if max_epoch <= 8 else 2
     for index, job in enumerate(jobs):
         rows = histories[job["id"]]
         for axis, key in zip(axes, ("loss", "eval_loss")):
@@ -67,8 +75,8 @@ def draw(axes, jobs, histories, group):
         axis.set_title(f"{group} — {split}")
         axis.set_xlabel("Epoch")
         axis.set_ylabel("Token CE" if group == "PT" else "DINR attribute loss")
-        axis.set_xlim(0, 8)
-        axis.set_xticks(range(9))
+        axis.set_xlim(0, max_epoch)
+        axis.set_xticks(range(0, max_epoch + 1, tick_step))
         axis.grid(alpha=0.2)
         handles, _ = axis.get_legend_handles_labels()
         if handles:
@@ -82,7 +90,19 @@ def main():
     parser.add_argument("--campaign", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with (args.output_dir / ".refresh.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        render(args)
+
+
+def render(args):
     manifest = json.loads((args.campaign / "manifest.json").read_text())
+    # Section 7's five-by-two figure is reserved for its original 12 jobs.
+    # Follow-up experiments receive separate figures in their own sections.
+    if any(job["id"] == "pt_scratch_full8" for job in manifest["jobs"]):
+        args.campaign = Path(__file__).resolve().parents[2] / "results/halfepoch_earlystop_20261112"
+        manifest = json.loads((args.campaign / "manifest.json").read_text())
     jobs = manifest["jobs"]
     histories = {j["id"]: history(j) for j in jobs}
     output = args.output_dir

@@ -46,8 +46,14 @@ def main():
     parser.add_argument("--eval-split", choices=["none", "train", "valid", "test"], default="none")
     parser.add_argument("--pedal-mode", choices=["ce", "bce", "none"], default="ce")
     parser.add_argument("--numerical-coordinates", action="store_true",
-                        help="Add Fourier numerical coordinates to timing/velocity token embeddings.")
+                        help="Add numerical coordinates to timing/velocity token embeddings.")
     parser.add_argument("--coordinate-frequencies", type=int, default=16)
+    parser.add_argument("--coordinate-encoding", choices=["linear", "mlp", "fourier"], default="fourier")
+    parser.add_argument("--coordinate-hidden-size", type=int, default=32)
+    parser.add_argument("--coordinate-combination", choices=["add", "replace"], default="add",
+                        help="Add coordinates to lookup embeddings, or replace numerical lookups entirely.")
+    parser.add_argument("--separate-coordinate-projections", action="store_true",
+                        help="Use independent numerical mappings for IOI, duration, and velocity.")
     parser.add_argument("--decoder-mask-probability", type=float, default=0.0,
                         help="Probability of masking each selected decoder note or attribute.")
     parser.add_argument("--decoder-mask-mode",
@@ -126,6 +132,10 @@ def main():
         pedal_mode=args.pedal_mode,
         numerical_coordinates=args.numerical_coordinates,
         coordinate_frequencies=args.coordinate_frequencies,
+        coordinate_encoding=args.coordinate_encoding,
+        coordinate_hidden_size=args.coordinate_hidden_size,
+        coordinate_combination=args.coordinate_combination,
+        separate_coordinate_projections=args.separate_coordinate_projections,
         decoder_mask_probability=args.decoder_mask_probability,
         decoder_mask_mode=args.decoder_mask_mode,
         separate_ioi_duration_tables=args.separate_ioi_duration_token_tables,
@@ -134,6 +144,26 @@ def main():
     )
     if args.pretrained_pt:
         print("PT initialization:", model.initialize_from_pt(args.pretrained_pt))
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    representation_audit = {
+        "coordinate_combination": model.coordinate_combination,
+        "coordinate_encoding": model.coordinate_encoding,
+        "token_lookup_rows": model.token_embedding.num_embeddings,
+        "numerical_lookup_rows": 0,
+        "coordinate_parameters": sum(p.numel() for n, p in model.named_parameters()
+                                     if "coordinate_projection" in n),
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "has_ioi_lookup": model.ioi_token_embedding is not None,
+        "has_duration_lookup": model.duration_token_embedding is not None,
+    }
+    if model.coordinate_combination != "replace":
+        from src.data_process.dinr_dataset import DINRTokenSpec
+        representation_audit["numerical_lookup_rows"] = (
+            DINRTokenSpec.timing_bins + DINRTokenSpec.velocity_bins
+            + (2 * DINRTokenSpec.timing_bins if model.ioi_token_embedding is not None else 0)
+        )
+    (args.output_dir / "representation_audit.json").write_text(json.dumps(representation_audit, indent=2) + "\n")
+    print("Representation audit:", representation_audit, flush=True)
     training_args = TrainingArguments(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
@@ -194,6 +224,10 @@ def main():
             "separate_ioi_duration_token_tables": args.separate_ioi_duration_token_tables,
             "numerical_coordinates": args.numerical_coordinates,
             "coordinate_frequencies": args.coordinate_frequencies,
+            "coordinate_encoding": args.coordinate_encoding,
+            "coordinate_hidden_size": args.coordinate_hidden_size,
+            "coordinate_combination": args.coordinate_combination,
+            "separate_coordinate_projections": args.separate_coordinate_projections,
             "decoder_mask_probability": args.decoder_mask_probability,
             "decoder_mask_mode": args.decoder_mask_mode,
             "decoder_timestep_mask_vector": (

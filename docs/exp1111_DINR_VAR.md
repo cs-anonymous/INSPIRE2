@@ -170,7 +170,7 @@ Validation loss 单独看并不能决定最终配置：它偏好 shared no-mask�
 
 沿用 held-out-12-work split、seed 42 和 effective batch 32。DINR 使用单卡 batch 32、学习率 `3e-4` 和 linear decay；PT 使用单卡 batch 2 × gradient accumulation 16、学习率 `5e-4` 和 cosine decay。PT 上一轮的双卡 batch 2 × accumulation 8 改为单卡队列，effective batch 仍为 32。DINR timestep 使用当前代码的整 note mask（`decoder_mask_mode=note`），timestep 1+pitch 使用 `timestep_single`。
 
-本轮所有配置均完成 19 首 test work × 2 samples（38 个生成）。HR 使用本文件第 1 节定义的逐 note-index Wasserstein 口径。新的训练、valid 曲线、最佳 checkpoint、停止 epoch 和 HR 汇总位于 [`epx1111_halfepoch`](../analysis/epx1111_halfepoch/)。五列两行总图中，五列依次为 PT、DINR attribute、DINR timestep、DINR none、DINR `timestep 1+pitch`；第一行是逐 optimizer step 的 train loss，第二行是每半个 epoch 的 valid loss。
+本轮所有配置均完成 19 首 test work × 2 samples（38 个生成）。HR 使用本文件第 1 节定义的逐 note-index Wasserstein 口径。新的训练、valid 曲线、最佳 checkpoint、停止 epoch 和 HR 汇总位于 [`epx1111_halfepoch`](../analysis/epx1111_halfepoch/)。Section 7 的五列两行总图仅含本轮 12 项实验；五列依次为 PT、DINR attribute、DINR timestep、DINR none、DINR `timestep 1+pitch`，第一行是逐 optimizer step 的 train loss，第二行是每半个 epoch 的 valid loss。后续实验统一另绘 K 列两行图。
 
 ![五组 train/valid 曲线，五列两行](../analysis/epx1111_halfepoch/all_groups.png)
 
@@ -196,20 +196,108 @@ Validation loss 单独看并不能决定最终配置：它偏好 shared no-mask�
 <!-- PT_SCRATCH_FULL8_BEGIN -->
 ### 7.1 PT scratch：关闭早停，双卡完整训练 8 epoch
 
-状态：**双卡训练中**。仅 PT scratch 重新从随机初始化训练；使用 GPU0、GPU1 的 DDP，每卡 batch 2 × gradient accumulation 8，全局 batch 32。关闭 early stopping，固定训练 8 epoch；每半个 epoch 验证一次，共 16 次，仍只保留 valid loss 最低的 checkpoint。学习率 `5e-4`、cosine decay、seed 42 和 held-out split 沿用本轮设置。
+状态：**训练与测试评估全部完成**。仅 PT scratch 重新从随机初始化训练；使用 GPU0、GPU1 的 DDP，每卡 batch 2 × gradient accumulation 8，全局 batch 32。关闭 early stopping，固定训练 8 epoch；每半个 epoch 验证一次，共 16 次，仍只保留 valid loss 最低的 checkpoint。学习率 `5e-4`、cosine decay、seed 42 和 held-out split 沿用本轮设置。
 
-旧 scratch 在 epoch 1 的 valid loss 为 3.045935；epoch 2、2.5、3 分别为 3.307507、3.224152、3.075577，最后两次正在下降但未超过历史最佳，因此触发 patience 4。完整 8 epoch 实验用来检查后续能否再次改善。上方原 12 项表格保留早停实验结果；五列两行图的 PT 列同时显示早停版与完整 8 epoch 版。
+旧 scratch 在 epoch 1 的 valid loss 为 3.045935；epoch 2、2.5、3 分别为 3.307507、3.224152、3.075577，最后两次正在下降但未超过历史最佳，因此触发 patience 4。完整 8 epoch 实验用来检查后续能否再次改善。上方原 12 项表格和五列两行总图只保留早停版；完整 8 epoch 版放在后续实验的独立 K 列两行图中。
 
-已记录 validation：0/16。
+已记录 validation：16/16。
 
 | method | Best valid epoch | Best valid loss | Final epoch | IOI HR | Dur HR | Vel HR | PN HR |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PT scratch full 8ep | — | — | — | — | — | — | — |
+| PT scratch full 8ep | 1.5011673151750973 | 3.114427 | 8.0 | 34.1373 | 81.7223 | 3.3218 | 39.7271 |
 
 训练后自动选择最佳 valid checkpoint，使用双卡、每卡 4 workers 完成 19 首 × 2 samples；temperature 1.0、top-p 0.95、seed 42，按相同 DINR note-index W1 和 human anchors 计算分项 HR。
 
 运行产物：[`pt_scratch_halfepoch_full8_2gpu`](../../results/pt_scratch_halfepoch_full8_2gpu/)，包括 `config.json`、`status.json`、`train.log`、完整 loss 历史、最佳 checkpoint、测试 MIDI 和 `hr.json`。
+
+训练与进程退出状态：完整 loss 历史及最终 trainer state 均确认 **epoch 8、5144 optimizer steps、16 次 validation**；训练结束时 DDP/NCCL 的 ALLGATHER 同步超时，使 torchrun 返回失败，原自动测试因此未触发。已核验保存的唯一最佳 checkpoint（step 965，epoch 1.5012），保留原始报错记录，单独恢复最佳模型测试，未重新训练。
+
+**训练曲线结论：本次跑满 8 epoch 没有在后期刷新 valid 最佳值。** epoch 1.5012 最低为 3.114427；epoch 3 为 3.376163，3.5012 短暂降到 3.293414，随后整体升高，epoch 8 为 3.879771。即使中间有局部下降，后续也未超过历史最佳；本次结果不支持延长到 8 epoch 能改善该配置的 best valid。双卡运行的随机数消耗和数据分配与前一轮单卡不同，不能把两轮不同的最低 loss 单独归因于早停。
 <!-- PT_SCRATCH_FULL8_END -->
+
+<!-- DINR_COORD_QUEUE_BEGIN -->
+### 7.2 timestep 1+pitch：lookup + coordinate 附加编码对照
+
+**实现范围澄清：本节保留数值 lookup，再加坐标分支；不是用坐标映射替代 lookup。其结果不能直接回答纯 coordinate 编码是否有效；纯映射替代实验见第 7.3 节。**
+
+GPU2 单卡顺序队列：**MLP → linear → Fourier**。固定 separate + abs 500 token、PT rendering 初始化、held-out-12 split、batch 32、LR `3e-4`、seed 42、linear scheduler、训练 decoder timestep mask 0.5。最多 8 epoch，每半 epoch 验证一次，连续 4 次未低于历史最低 valid 则早停；只保存最佳 valid checkpoint，train loss 每 optimizer step 记录。
+
+三个输入属性均采用 `lookup(token) + coordinate(value)`：IOI 与 Dur 为 `bin × 0.01` 秒，Vel 为 `value / 127`。**IOI、Dur、Vel 各有独立的数值映射**，score encoder 与 decoder history 共用对应属性表。pitch 不加坐标，PAD/BOS 和被 mask 属性不泄漏坐标。输出仍是原来的独立 linear heads + hard CE；本实验比较输入数值编码，不改变输出损失或引入 prototype head。
+
+| Encoding | 数值分支 | 三属性数值分支参数量 |
+|---|---|---:|
+| linear | `Linear(1, 768)`，含 bias | 4,608 |
+| MLP | `Linear(1,32) → GELU → Linear(32,768)`，含 bias | 76,224 |
+| Fourier | `[x, sin(kπx), cos(kπx)]`，`k=1..16`，再 `Linear(33,768,bias=False)` | 76,032 |
+
+MLP 与 Fourier 数值分支容量接近；linear 刻意保留为低容量线性对照。每组从相同 PT checkpoint 独立初始化，沿用已有无 coordinate 的 separate + abs500 对照：best valid `10.454540`（epoch 4.5），PN HR `2.0144`。
+
+| Encoding | 状态 | Latest epoch | Valid 次数 | Best epoch | Best valid | IOI HR | Dur HR | Vel HR | PN HR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| mlp | 已完成 | 8.000 | 16 | 6.000 | 10.637312 | 2.7696 | 2.3965 | 1.8535 | 2.3399 |
+| linear | 已完成 | 8.000 | 16 | 8.000 | 11.249613 | 3.0432 | 2.2141 | 2.4649 | 2.5741 |
+| fourier | 已完成 | 7.000 | 14 | 5.000 | 11.180223 | 4.3324 | 2.5972 | 2.4231 | 3.1175 |
+
+训练后自动使用 best valid checkpoint 对 19 首 × 2 samples 测试（GPU2、8 workers，temperature 1、top-p 0.9），计算相同 DINR note-index W1 / human-anchor HR。三种 coordinate 编码的曲线放在后续实验独立 K 列两行图的 `Lookup + coordinate` 组；不并入第 7 节原始五列总图。
+
+配置、命令、状态与完整日志：[`dinr_single_pitch_coord_queue_gpu2`](../../results/dinr_single_pitch_coord_queue_gpu2/)。
+
+#### 7.2.1 完成结果与结论
+
+三组均完成训练及 **19 首 × 2 samples，共 38 个生成**。MLP 和 linear 训练到 epoch 8；Fourier 在 epoch 5 达到 best valid，随后连续 4 次验证未改善，在 epoch 7 早停。
+
+**三种 coordinate 编码都没有超过无 coordinate 基线。** 按 test PN HR（越低越好）排序：无 coordinate **2.0144** < MLP **2.3399** < linear **2.5741** < Fourier **3.1175**。相对基线，MLP、linear、Fourier 的 PN HR 分别升高 **16.2%、27.8%、54.8%**；三组各自的 IOI、duration、velocity 分项 HR 也都高于基线。当前配置继续保留 lookup-only 作为优选。
+
+**MLP 是本轮最好的坐标编码，但不能据此说增加非线性就一定更好。** MLP 的 best valid 为 10.637312，优于 Fourier 的 11.180223 和 linear 的 11.249613；test PN HR 相比 linear 降低约 9.1%，相比 Fourier 降低约 24.9%。Fourier 的 best valid 略优于 linear，test HR 却更差，说明该小范围比较中 teacher-forcing valid loss 与生成 HR 的排序并不完全一致。
+
+**曲线与适用范围。** linear 到 epoch 8 仍刷新 valid 最低值，因此这里只能比较当前最多 8 epoch 的预算，不能断言它训练更久仍不会改善。MLP 在 epoch 6 后 valid 回升；Fourier 在 epoch 5 后不再刷新最低值。三组都只运行 seed 42，MLP 与 Fourier 数值分支参数量接近，而 linear 参数更少；映射结构变化也会改变随机数消耗及新增参数初始化。当前结果不足以断言 Fourier 普遍无效或 MLP 普遍优越。本轮只比较输入端 `lookup + coordinate`，输出仍是原来的 hard CE，因此也没有检验带坐标的输出 prototypes、ordinal loss 或距离感知 loss 的效果。
+
+原始曲线与汇总：[五列两行总图](../analysis/epx1111_halfepoch/all_groups.png) · [逐步 loss CSV](../analysis/epx1111_halfepoch/all_losses.csv) · [实验结果 CSV](../analysis/epx1111_halfepoch/all_experiments.csv)。后续曲线见[独立 K 列两行图](../analysis/epx1111_halfepoch/followup_groups.png)及其 [PDF](../analysis/epx1111_halfepoch/followup_groups.pdf) 和 [CSV](../analysis/epx1111_halfepoch/followup_all_losses.csv)。当前后续实验分为 K=4 组，因此图为四列两行。
+<!-- DINR_COORD_QUEUE_END -->
+
+<!-- DINR_PURE_COORD_QUEUE_BEGIN -->
+### 7.3 timestep 1+pitch：纯 coordinate 替代数值 lookup
+
+**定义：`e_IOI=f_IOI(bin×0.01秒)`、`e_Dur=f_Dur(bin×0.01秒)`、`e_Vel=f_Vel(value/127)`，三个映射独立；数值 embedding 完全由映射计算，没有 lookup 残差，也没有 IOI、Dur、Vel 的可学习 lookup 行。** 仅 pitch 与特殊符号保留 `133×768` 的 compact embedding 表；PAD 为零，BOS 沿用特殊符号表示。score encoder 与 decoder history 使用同一套对应属性映射；`timestep 1+pitch` mask 行只保留 pitch 加单个 mask vector。
+
+GPU2 队列原计划包含 Fourier；训练开始后决定取消该项，并改为单独运行 linear 16 epoch。已完成的 pure-coordinate 对照仍为 separate + abs500、10 ms bins、PT rendering backbone/pitch 初始化、seed42、batch32、LR3e-4、linear decay、无 warmup、最多8 epoch、每半 epoch验证、patience4、只保存 best valid checkpoint，train 每 optimizer step 记录。linear 16 epoch 沿用该配置，仅将 epoch 上限改为16。数值映射为随机初始化，不能从 PT 的独立数值 lookup 精确复制；未增加预拟合或蒸馏。输出仍是 grouped/chord IOI、Dur、Vel 的原分类 heads + hard CE，分类头参数仍依赖 bins 数。
+
+| 方法 | 每属性数值映射 | 三属性映射参数量 | 数值 lookup 参数量 |
+|---|---|---:|---:|
+| MLP | `Linear(1,32) → GELU → Linear(32,768)` | 76,224 | **0** |
+| linear | `Linear(1,768)`，含 bias | 4,608 | **0** |
+
+本轮纯 coordinate 比较聚焦 MLP 与 linear；中止的 Fourier 训练不作为结果，不纳入图表和比较。每组 `representation_audit.json` 记录实际数值 lookup 行数与映射参数量；测试从 checkpoint 权重自动识别 compact lookup 和 coordinate 结构。
+
+| 方法 | 状态 | Latest epoch | Valid 次数 | Best epoch | Best valid | IOI HR | Dur HR | Vel HR | PN HR |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| mlp | 已完成 | 8.000 | 16 | 8.000 | 11.196815 | 3.3451 | 2.2988 | 2.2827 | 2.6422 |
+| linear | 已完成 | 8.000 | 16 | 8.000 | 11.392002 | 3.5701 | 2.3292 | 2.0883 | 2.6625 |
+| linear (16ep) | 已完成 | 13.500 | 27 | 11.500 | 11.318710 | 3.6204 | 2.3713 | 2.7579 | 2.9165 |
+
+8 epoch 对照与 linear 16 epoch 任务使用 best valid checkpoint 完成 **19首×2 samples**测试，GPU2、8 workers、temperature1、top-p0.9；按相同 note-index W1/human anchors 计算 HR。曲线放入后续独立 K 列两行图的 `Pure coordinate replacement` 组，不并入第 7 节原始总图。无 coordinate 的 lookup-only 基线 PN HR 为 **2.0144**；第7.2节 lookup+coord 的 MLP/linear/Fourier 为已完成的独立实验，PN HR 为 **2.3399 / 2.5741 / 3.1175**。
+
+运行目录：[纯 coordinate 队列](../../results/dinr_single_pitch_pure_coord_queue_gpu2/)，包含命令、结构审计、完整loss、最佳权重、测试MIDI及HR。
+<!-- DINR_PURE_COORD_QUEUE_END -->
+
+<!-- DINR_PURE_MLP_16EP_BEGIN -->
+### 7.4 纯 MLP coordinate：16 epoch 与隐层宽度对照
+
+在第7.3节纯 coordinate 实验上继续验证训练预算和映射容量。GPU0 使用 `1→32→768`，GPU1 使用 `1→128→768`；均为每属性独立两层 MLP、无 timing/velocity lookup。其余配置一致：separate + abs500、`timestep 1+pitch`、seed42、batch32、LR `5e-4`、cosine scheduler、warmup0、最多16 epoch、每半 epoch validation、patience4、仅保存 best valid checkpoint。
+
+调度器按最多16 epoch对应的 5152 optimizer steps 预先构造。若 patience 4 触发，则在早停点结束；若未触发，计划末尾 LR 按 cosine 降到接近零。训练数据和 held-out split 沿用前两轮。
+
+| GPU | 每属性映射 | 三属性映射参数 | 状态 | Epoch | Validation | Best epoch | Best valid | IOI HR | Dur HR | Vel HR | PN HR |
+|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | `1→32→768` | 76,224 | 已完成 | 9.500 | 19 | 7.500 | 11.216751 | 3.0580 | 2.2367 | 2.2943 | 2.5296 |
+| 1 | `1→128→768` | 297,984 | 已完成 | 11.000 | 22 | 9.000 | 11.203219 | 3.7883 | 2.3316 | 2.9842 | 3.0347 |
+
+第7.3节 pure MLP-32（LR3e-4、linear decay、8 epoch）best valid 为 11.196815（epoch 8.000），test PN HR 2.6422。由于本节同时把学习率从3e-4改为5e-4并改用cosine，与第7.3节的差异不能单独归因为训练时长或 MLP 宽度；GPU0/1 两组之间才是相同训练协议下的宽度对照。
+
+本节单独绘制 16 epoch 的 32/128 宽 MLP 对照图，不并入第7节五组总图：[训练/valid 曲线](../../results/dinr_single_pitch_pure_mlp_16ep_gpu01/width_comparison.png) · [PDF](../../results/dinr_single_pitch_pure_mlp_16ep_gpu01/width_comparison.pdf) · [逐步 CSV](../../results/dinr_single_pitch_pure_mlp_16ep_gpu01/all_losses.csv)。
+
+运行配置、表示结构审计、日志、best checkpoint、测试 MIDI 和 HR：[32/128 宽 MLP 双卡实验](../../results/dinr_single_pitch_pure_mlp_16ep_gpu01/)。
+<!-- DINR_PURE_MLP_16EP_END -->
 
 ## 8. 结果文件索引
 

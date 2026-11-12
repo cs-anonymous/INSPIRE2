@@ -55,6 +55,31 @@ def make_model(args, checkpoint):
     slot_projection = state.get("note_slot_projection")
     num_input_slots = int(slot_projection.shape[0]) if slot_projection is not None else None
     separate_ioi_duration_tables = "ioi_token_embedding.weight" in state
+    # Recover the numerical encoder from the weights, including old Fourier
+    # checkpoints. Never silently discard a trained coordinate branch.
+    numerical_coordinates = any(k.startswith("timing_coordinate_projection.") for k in state)
+    coordinate_encoding = "fourier"
+    coordinate_hidden_size = 32
+    coordinate_frequencies = 16
+    if "timing_coordinate_projection.0.weight" in state:
+        coordinate_encoding = "mlp"
+        coordinate_hidden_size = state["timing_coordinate_projection.0.weight"].shape[0]
+    elif numerical_coordinates:
+        width = state["timing_coordinate_projection.weight"].shape[1]
+        coordinate_encoding = "linear" if width == 1 else "fourier"
+        if width > 1:
+            coordinate_frequencies = (width - 1) // 2
+    separate_coordinates = any(k.startswith("duration_coordinate_projection.") for k in state)
+    coordinate_combination = (
+        "replace" if state["token_embedding.weight"].shape[0] == DINRTokenSpec.velocity_start else "add"
+    )
+    if coordinate_combination == "replace":
+        separate_ioi_duration_tables = True
+    requested_encoding = getattr(args, "coordinate_encoding", None)
+    if requested_encoding and (not numerical_coordinates or requested_encoding != coordinate_encoding):
+        raise ValueError("Requested coordinate encoder does not match checkpoint")
+    if args.numerical_coordinates and not numerical_coordinates:
+        raise ValueError("Checkpoint has no numerical coordinate weights")
     config = PianoT5GemmaConfig(
         encoder_layers_num=args.encoder_layers,
         decoder_layers_num=args.decoder_layers,
@@ -68,8 +93,12 @@ def make_model(args, checkpoint):
     model = DINRAbsoluteModel(
         config,
         pedal_mode=args.pedal_mode,
-        numerical_coordinates=args.numerical_coordinates,
-        coordinate_frequencies=args.coordinate_frequencies,
+        numerical_coordinates=numerical_coordinates,
+        coordinate_frequencies=coordinate_frequencies,
+        coordinate_encoding=coordinate_encoding,
+        coordinate_combination=coordinate_combination,
+        coordinate_hidden_size=coordinate_hidden_size,
+        separate_coordinate_projections=separate_coordinates,
         num_input_slots=num_input_slots,
         separate_ioi_duration_tables=separate_ioi_duration_tables,
         decoder_mask_mode="timestep",
@@ -77,6 +106,8 @@ def make_model(args, checkpoint):
         time_input_mode=args.time_input_mode or "linear",
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
+    if any("coordinate_projection" in k or "token_embedding" in k for k in missing + unexpected):
+        raise ValueError("Coordinate checkpoint tensors were not restored exactly")
     if missing:
         print(f"warning: missing checkpoint tensors={len(missing)}")
     if unexpected:
@@ -280,6 +311,8 @@ def parse_args():
     parser.add_argument("--pedal-mode", choices=["ce", "bce", "none"], default="ce")
     parser.add_argument("--numerical-coordinates", action="store_true")
     parser.add_argument("--coordinate-frequencies", type=int, default=16)
+    parser.add_argument("--coordinate-encoding", choices=["linear", "mlp", "fourier"], default=None,
+                        help="Optional assertion; encoder architecture is recovered from checkpoint weights.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--intermediate-size", type=int, default=3072)

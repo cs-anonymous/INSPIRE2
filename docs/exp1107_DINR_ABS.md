@@ -53,7 +53,7 @@ bash script/run_dinr_stage1_mask_ablation_3gpu.sh 0 1 2
 
 ### 第一阶段 mask 对比结果
 
-**以下是第一阶段 mask pilot 的 train/valid 曲线。** 其中整-note `timestep_random` 是有效的 legacy timestep 结果；它会 mask pitch，与后续保留 pitch 的配置不同。该组统一 test HR 与修正后的六组结果见 [epx1111_DINR_VAR.md](epx1111_DINR_VAR.md)。曲线仍见 [loss_curves.png](../analysis/dinr_stage1_mask_ablation/loss_curves.png)，原始表格见 [losses.csv](../analysis/dinr_stage1_mask_ablation/losses.csv)。
+**以下是第一阶段 mask pilot 的 train/valid 曲线。** 其中整-note `timestep_random` 是有效的 legacy timestep 结果；它会 mask pitch，与后续保留 pitch 的配置不同。该组统一 test HR 与修正后的六组结果见 [exp1111_DINR_VAR.md](exp1111_DINR_VAR.md)。曲线仍见 [loss_curves.png](../analysis/dinr_stage1_mask_ablation/loss_curves.png)，原始表格见 [losses.csv](../analysis/dinr_stage1_mask_ablation/losses.csv)。
 
 | Epoch | Attribute train | Attribute valid | Timestep train | Timestep valid | No-mask train | No-mask valid |
 |---:|---:|---:|---:|---:|---:|---:|

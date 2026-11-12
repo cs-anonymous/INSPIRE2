@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TABLE_PATH = ROOT / "analysis/dinr_six_model_hr_comparison/all_experiments.csv"
-DOC_PATH = ROOT / "docs/epx1111_DINR_VAR.md"
+DOC_PATH = ROOT / "docs/exp1111_DINR_VAR.md"
 RUN_ROOT = ROOT / "models/dinr_mask_revised_heldout12_8ep"
 HISTORICAL_SUMMARY_PATH = ROOT / "analysis/dinr_six_model_hr_comparison/summary.json"
 ANCHORS = {

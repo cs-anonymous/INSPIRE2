@@ -79,12 +79,31 @@ class DINRAbsoluteModel(nn.Module):
                  numerical_coordinates=False, coordinate_frequencies=16,
                  decoder_mask_probability=0.0, decoder_mask_mode="note",
                  num_input_slots=None, separate_ioi_duration_tables=False,
-                 timing_target_mode="absolute", time_input_mode="linear"):
+                 timing_target_mode="absolute", time_input_mode="linear",
+                 coordinate_encoding="fourier", coordinate_hidden_size=32,
+                 separate_coordinate_projections=False, coordinate_combination="add"):
         super().__init__()
         self.config = config or PianoT5GemmaConfig()
         self.pedal_mode = str(pedal_mode).lower()
         self.numerical_coordinates = bool(numerical_coordinates)
         self.coordinate_frequencies = max(1, int(coordinate_frequencies))
+        self.coordinate_encoding = str(coordinate_encoding)
+        self.coordinate_hidden_size = int(coordinate_hidden_size)
+        self.separate_coordinate_projections = bool(separate_coordinate_projections)
+        self.coordinate_combination = str(coordinate_combination)
+        if self.coordinate_combination not in {"add", "replace"}:
+            raise ValueError("coordinate_combination must be add or replace")
+        if self.coordinate_combination == "replace" and (
+            not self.numerical_coordinates or not self.separate_coordinate_projections
+            or self.pedal_mode != "none"
+        ):
+            raise ValueError("Coordinate replacement requires three independent numerical mappings and no pedals")
+        if self.coordinate_encoding not in {"linear", "mlp", "fourier"}:
+            raise ValueError("coordinate_encoding must be linear, mlp, or fourier")
+        if self.coordinate_hidden_size < 1:
+            raise ValueError("coordinate_hidden_size must be positive")
+        if self.separate_coordinate_projections and not self.numerical_coordinates:
+            raise ValueError("Separate coordinate projections require numerical_coordinates")
         self.decoder_mask_probability = float(decoder_mask_probability)
         self.decoder_mask_mode = str(decoder_mask_mode).lower()
         self.separate_ioi_duration_tables = bool(separate_ioi_duration_tables)
@@ -107,17 +126,19 @@ class DINRAbsoluteModel(nn.Module):
         self.backbone = PianoT5GemmaModel(self.config)
         self.backbone.encoder = DINRNoteEncoder(self.config.encoder)
         self.token_embedding = nn.Embedding(
-            DINRTokenSpec.vocab_size,
+            # Replacement has no learned rows for timing or velocity values.
+            DINRTokenSpec.velocity_start if self.coordinate_combination == "replace"
+            else DINRTokenSpec.vocab_size,
             self.config.hidden_size,
             padding_idx=DINRTokenSpec.pad_id,
         )
         self.ioi_token_embedding = (
             nn.Embedding(DINRTokenSpec.timing_bins, self.config.hidden_size)
-            if self.separate_ioi_duration_tables else None
+            if self.separate_ioi_duration_tables and self.coordinate_combination != "replace" else None
         )
         self.duration_token_embedding = (
             nn.Embedding(DINRTokenSpec.timing_bins, self.config.hidden_size)
-            if self.separate_ioi_duration_tables else None
+            if self.separate_ioi_duration_tables and self.coordinate_combination != "replace" else None
         )
         self.decoder_mask_embedding = nn.Parameter(torch.empty(self.config.hidden_size))
         nn.init.normal_(self.decoder_mask_embedding, mean=0.0, std=self.config.initializer_range)
@@ -146,15 +167,24 @@ class DINRAbsoluteModel(nn.Module):
         self.pedal_heads = nn.ModuleList(
             [nn.Linear(hidden, pedal_width) for _ in range(4)]
         ) if self.pedal_mode != "none" else nn.ModuleList()
-        coordinate_dim = 1 + 2 * self.coordinate_frequencies
-        self.timing_coordinate_projection = (
-            nn.Linear(coordinate_dim, self.config.hidden_size, bias=False)
-            if self.numerical_coordinates else None
+        self.timing_coordinate_projection = self._make_coordinate_projection()
+        self.velocity_coordinate_projection = self._make_coordinate_projection()
+        self.duration_coordinate_projection = (
+            self._make_coordinate_projection() if self.separate_coordinate_projections else None
         )
-        self.velocity_coordinate_projection = (
-            nn.Linear(coordinate_dim, self.config.hidden_size, bias=False)
-            if self.numerical_coordinates else None
-        )
+
+    def _make_coordinate_projection(self):
+        if not self.numerical_coordinates:
+            return None
+        if self.coordinate_encoding == "linear":
+            return nn.Linear(1, self.config.hidden_size)
+        if self.coordinate_encoding == "mlp":
+            return nn.Sequential(
+                nn.Linear(1, self.coordinate_hidden_size), nn.GELU(),
+                nn.Linear(self.coordinate_hidden_size, self.config.hidden_size),
+            )
+        return nn.Linear(1 + 2 * self.coordinate_frequencies,
+                         self.config.hidden_size, bias=False)
 
     def initialize_from_pt(self, checkpoint):
         """Initialize compatible PT backbone and token embeddings when available."""
@@ -172,30 +202,34 @@ class DINRAbsoluteModel(nn.Module):
             target_embedding[DINRTokenSpec.pitch_start: DINRTokenSpec.pitch_start + DINRTokenSpec.pitch_bins].copy_(
                 source_embedding[5:133]
             )
-            target_embedding[DINRTokenSpec.velocity_start: DINRTokenSpec.velocity_start + DINRTokenSpec.velocity_bins].copy_(
-                source_embedding[133:261]
-            )
-            timing_embeddings = []
-            for timing_id in range(DINRTokenSpec.timing_bins):
-                old_start = 261 + timing_id * DINRTokenSpec.timing_bin_ms
-                old_end = old_start + DINRTokenSpec.timing_bin_ms
-                timing_embeddings.append(source_embedding[old_start:old_end].mean(dim=0))
-            timing_embeddings = torch.stack(timing_embeddings)
-            target_embedding[
-                DINRTokenSpec.timing_start:
-                DINRTokenSpec.timing_start + DINRTokenSpec.timing_bins
-            ].copy_(timing_embeddings)
-            if self.separate_ioi_duration_tables:
-                self.ioi_token_embedding.weight.copy_(timing_embeddings)
-                self.duration_token_embedding.weight.copy_(timing_embeddings)
-            target_embedding[DINRTokenSpec.pedal_start].copy_(source_embedding[5261])
-            target_embedding[DINRTokenSpec.pedal_start + 1].copy_(source_embedding[5325])
+            if self.coordinate_combination != "replace":
+                target_embedding[DINRTokenSpec.velocity_start: DINRTokenSpec.velocity_start + DINRTokenSpec.velocity_bins].copy_(
+                    source_embedding[133:261]
+                )
+                timing_embeddings = []
+                for timing_id in range(DINRTokenSpec.timing_bins):
+                    old_start = 261 + timing_id * DINRTokenSpec.timing_bin_ms
+                    old_end = old_start + DINRTokenSpec.timing_bin_ms
+                    timing_embeddings.append(source_embedding[old_start:old_end].mean(dim=0))
+                timing_embeddings = torch.stack(timing_embeddings)
+                target_embedding[
+                    DINRTokenSpec.timing_start:
+                    DINRTokenSpec.timing_start + DINRTokenSpec.timing_bins
+                ].copy_(timing_embeddings)
+                if self.separate_ioi_duration_tables:
+                    self.ioi_token_embedding.weight.copy_(timing_embeddings)
+                    self.duration_token_embedding.weight.copy_(timing_embeddings)
+                target_embedding[DINRTokenSpec.pedal_start].copy_(source_embedding[5261])
+                target_embedding[DINRTokenSpec.pedal_start + 1].copy_(source_embedding[5325])
         return {"loaded_backbone_tensors": len(compatible),
+                "numerical_lookup_initialized": self.coordinate_combination != "replace",
                 "missing_backbone_tensors": len(missing),
                 "unused_source_tensors": len(unexpected)}
 
     def _coordinate_features(self, values):
         values = values.float().unsqueeze(-1)
+        if self.coordinate_encoding != "fourier":
+            return values
         frequencies = torch.arange(
             1, self.coordinate_frequencies + 1,
             device=values.device, dtype=values.dtype,
@@ -209,8 +243,14 @@ class DINRAbsoluteModel(nn.Module):
                 f"Expected [batch, notes, {self.num_input_slots}] token blocks, "
                 f"got {tuple(tokens.shape)}"
             )
-        embeds = self.token_embedding(tokens)
-        if self.separate_ioi_duration_tables:
+        lookup_tokens = tokens
+        if self.coordinate_combination == "replace":
+            # Numeric IDs only select coordinates. They never index a learned
+            # numerical table; PAD's embedding is zero.
+            lookup_tokens = tokens.masked_fill(tokens >= DINRTokenSpec.velocity_start,
+                                                DINRTokenSpec.pad_id)
+        embeds = self.token_embedding(lookup_tokens)
+        if self.ioi_token_embedding is not None:
             ioi_tokens = tokens[:, :, 1]
             ioi_mask = (
                 (ioi_tokens >= DINRTokenSpec.timing_start)
@@ -252,6 +292,11 @@ class DINRAbsoluteModel(nn.Module):
             timing_coord = self.timing_coordinate_projection(
                 self._coordinate_features(timing_seconds)
             )
+            if self.duration_coordinate_projection is not None:
+                timing_coord = timing_coord.clone()
+                timing_coord[:, :, 3, :] = self.duration_coordinate_projection(
+                    self._coordinate_features(timing_seconds[:, :, 3])
+                )
             embeds = embeds + timing_coord * timing_mask.unsqueeze(-1)
 
             velocity_mask = (
@@ -455,6 +500,10 @@ class DINRAbsoluteModel(nn.Module):
                 ),
                 "numerical_coordinates": self.numerical_coordinates,
                 "coordinate_frequencies": self.coordinate_frequencies,
+                "coordinate_encoding": self.coordinate_encoding,
+                "coordinate_combination": self.coordinate_combination,
+                "coordinate_hidden_size": self.coordinate_hidden_size,
+                "separate_coordinate_projections": self.separate_coordinate_projections,
                 "separate_ioi_duration_tables": self.separate_ioi_duration_tables,
                 "decoder_mask_probability": self.decoder_mask_probability,
                 "decoder_mask_mode": self.decoder_mask_mode,
