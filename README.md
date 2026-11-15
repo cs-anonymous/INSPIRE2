@@ -14,6 +14,19 @@ This is the official implementation for the paper **"Pianist Transformer: Toward
 
 Our work demonstrates that by pre-training on billions of tokens of unlabeled MIDI data, a model can learn a profound understanding of musical structures. This knowledge can then be transferred to the downstream task of expressive performance generation, producing piano performances that are statistically indistinguishable from those of human pianists in subjective listening tests.
 
+## Beat / Note timing experiments (exp1115)
+
+The beat-aware DINR design uses typed BEAT/NOTE events, 500-token log duration
+or log-deviation targets, and 500-token signed note onsets. A0 reuses existing
+results. The three-GPU queue covers 12 settings with three independent training
+seeds per setting and three sampling rounds per best checkpoint.
+
+![Beat DINR grouped train and validation loss](analysis/exp1115_beat/loss_groups.png)
+
+[Chinese design and execution protocol](docs/design1115_beat.md) ·
+[Live results and uncertainty](docs/exp1115_BEAT.md) ·
+[Frozen sidecar audit](docs/design1115_beat_data_audit.json)
+
 ## Key Features
 
 - **Unified Data Representation**: Eliminates the distinction between score MIDI and performance MIDI, allowing massive amounts of unlabeled performance data to be directly used for pre-training.

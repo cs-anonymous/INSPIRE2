@@ -246,12 +246,11 @@ encoder 输入和 decoder 目标都包含 beat 与 note，因此一个 window �
 
 | 编号 | Beat token | `measure_start` | Duration target | Duration 输入表 | Duration 输出 head | 目的 |
 |---|---|---|---|---|---|---|
-| A0 | 无 | 无 | 现有 note-only IOI/属性目标 | 现有配置 | 现有 head | legacy 端到端基线，不作为单因素对照 |
 | A1 | 有 | 有 | absolute-log | beat/note shared | beat/note separate | 默认 beat 结构基线 |
 | A2 | 有 | 有 | log-dev | beat/note shared | beat/note separate | 比较 absolute-log 与 score-relative target |
 | A3 | 有 | 无 | absolute-log | beat/note shared | beat/note separate | `measure_start` 消融 |
 
-A0 提供现有系统的端到端参照，但因 note-only 目标与 beat 目标不同，不是严格的单因素对照。A1 与 A2 判断输出采用 absolute-log 还是 log-dev；A1 与 A3 判断小节第一拍标记是否提供额外信息。A1、A2、A3 均使用相同的三个随机种子组。
+A0 已有 legacy note-only 结果，本轮不重新训练；旧目标与 beat 目标不同，不作为严格的单因素对照。A1 与 A2 判断输出采用 absolute-log 还是 log-dev；A1 与 A3 判断小节第一拍标记是否提供额外信息。A1、A2、A3 均使用相同的三个随机种子组。
 
 ### 9.3 队列 B：duration 输入表共享
 
@@ -297,3 +296,77 @@ C2 是可行的共享方案；C3 只作为诊断，不作为默认实现，因�
 窗口重建必须验证 score beat 到 note 的归属、performance beat anchors 的连续性、note 绝对起音、跨 beat 顺序、音符对齐、拍号变化、弱起、休止，以及 `u<0` 或 `u>1` 的音符。
 
 不能只凭 valid loss 选型；此前实验已观察到 loss 与 HR 不总是同向。首要检验点是两级时间表示是否更清晰且更易学习，质量结论仍需多随机种子及 held-out 指标支持。
+
+## 10. 实现协议与实际运行（2026-11-16）
+
+### 10.1 已实现的数据与模型
+
+实现入口为 [`build_dinr_beat_sidecars.py`](../src/data_process/build_dinr_beat_sidecars.py)、[`dinr_beat_dataset.py`](../src/data_process/dinr_beat_dataset.py)、[`dinr_beat.py`](../src/model/dinr_beat.py) 和 [`train_dinr_beat.py`](../src/train/train_dinr_beat.py)。BEAT/NOTE 共享事件拓扑，输入为属性向量相加；decoder 历史序列右移一位，第一位是 BOS，输出类型直接由已知的 score 事件类型决定。默认 BEAT 预测 duration，NOTE 预测 duration/onset/velocity，不生成 pitch 或事件类型。
+
+四个 head 的 CE 分别在其有效事件上求均值，再等权相加：beat duration、note duration、note onset、note velocity。PAD 不参与 loss。模型及所有数值表从随机权重初始化，不加载 PT rendering checkpoint。duration 输出可逐类型独立设置，覆盖 D1/D2；log-dev 输出加回未量化的 score log duration，再量化成 absolute-log 后用于下一步 decoder 历史输入。所有模型使用相同的 500-token 数值范围和量化器。
+
+本轮 decoder mask 沿用 timestep 的完整事件遮蔽：训练时每个非 BOS/PAD 的历史事件以 0.5 概率由一个可学习 mask 向量替换，包含该历史 note 的 pitch；验证与推理不遮蔽。score encoder 信息始终完整。duration shared 输入表按 beat/note 类型使用同一张 500 行表；separate 使用两张独立表。默认分开 beat/note 输出 head，C2 为共享投影加类型 bias，C3 无额外类型 bias/role projection。
+
+### 10.2 冻结 sidecar 与完整性审计
+
+数据写到外层 `data/ASAP_processed_dinr_beat_v1/`；sidecar 保存连续值，训练按配置量化，不为每项设置复制整份数据。work-level held-out 12 首验证集与旧协议一致，三种 split 在作品级互不重叠。
+
+| split | 作品 | 演奏 | 唯一 note | BEAT 事件 | 窗口 |
+|---|---:|---:|---:|---:|---:|
+| train | 175 | 837 | 2,739,556 | 414,749 | 10,447 |
+| valid | 12 | 47 | 135,467 | 24,132 | 507 |
+| test | 19 | 82 | 384,954 | 95,378 | 1,479 |
+
+窗口上限为 512 note，首事件是 BEAT、末事件是 NOTE，不能拆分同一 beat；完整保留窗口内部的无音符拍。相邻训练窗口约 50% note 重叠，实际起点落在 beat 边界。所有 note 均至少被一个窗口覆盖。最大事件长度分别是 train 811、valid 747、test 771；它大于 note 上限是因为还包含 BEAT 事件。
+
+Beat mapper 复用 ScorePerformer 的 onset-group performance 均值和线性插值；**调用 mapper 时将毫秒转成秒**，返回后转回毫秒，以匹配其 tempo-600 单调过滤阈值。这修正了初步统计脚本直接传毫秒导致的单位不一致，因此本轮裁剪比例以冻结 sidecar 的审计结果为准，不能直接把前文初步统计当成完全相同的数据版本。
+
+测试沿用旧评估中两首 MS-score 的 MUSICAL51 fallback，避免漏掉测试作品。其标签未经过 grouped-median 归一化；其他作品保留已有 grouped-median 标签。每个来源的时间归一化元信息保存在 sidecar 中；本轮不悄悄改变这两首的归一化规则。完整裁剪统计与文件 SHA256 见 [数据审计](design1115_beat_data_audit.json)，重算入口为 [`audit_dinr_beat.py`](../script/audit_dinr_beat.py)。
+
+500-token 端点裁剪比例（包括下界与上界，连续值仍保存在 sidecar）：
+
+| split | beat abs-log | beat log-dev | note abs-log | note log-dev | note onset |
+|---|---:|---:|---:|---:|---:|
+| train | 0.574% | 0.004% | 0.647% | 3.794% | 0.072% |
+| valid | 0.224% | 0.004% | 0.512% | 4.191% | 0.054% |
+| test | 0.070% | 0.008% | 0.380% | 4.166% | 0.767% |
+
+这说明 note log-dev 的 `[-2,3]` 仍会裁掉约 4% 的尾部；首轮遵守统一约定区间并报告裁剪，不根据 test 临时扩大词表。输入 score absolute-log 的裁剪比例单列保存在审计 JSON 中。
+
+### 10.3 三卡完整队列与依赖
+
+A0 不运行。每项设置三个独立训练种子，因此计划共 **12 项设置、36 次训练**；每个最佳模型额外做三轮测试采样。A1/A2/A3/B1/B2/C2/C3/D1/D2/D4 使用训练种子 42、43、44；D3/D5 为独立复验，使用 45、46、47。采样标准差和训练标准差分别记录，不把“三次采样”当成“三次训练”。
+
+1. 第一阶段运行 A1/A2/A3/B1/B2，共 15 次训练。
+2. C1 复用对应的 A1/A2 结果；C2/C3 在 A1/A2 中选择更好的 duration target，共 6 次训练。
+3. D1/D2 使用 shared 输入表、separate 输出 head，分别比较 beat absolute-log + note log-dev 与 beat log-dev + note absolute-log，共 6 次训练；本轮两个组合都运行。
+4. 在 A1/A2/D1/D2 中选择 duration target 组合。D3 对该 shared 输入表 + separate head 组合独立复验；D4 使用相同 duration target，改为 separate 输入表 + shared conditioned head，共 6 次训练。
+5. 在 A–D4 中选择表现更好的设置，D5 翻转该设置的 `measure_start` 属性作独立复验，共 3 次训练。
+
+为了使自动队列可复现，以上配置选择只采用 **valid 贪心预测的物理误差**，不查看 test：beat duration log MAE、note duration log MAE、note onset ratio MAE、velocity MAE/127 四项的平均值，再跨三个训练种子求均值。模型 checkpoint 的选择仍按最低总 valid CE。这个分数是预先约定的队列控制规则，不宣称取代全部生成质量指标；各 head、JS、HR 仍完整报告。
+
+全部设置最大 16 epoch；每半 epoch 验证一次；patience=4；只保留最低 valid checkpoint。AdamW，初始 LR 3e-4、线性衰减、无 warmup，weight decay=0，有效 batch=32（microbatch=8、累积=4）。若出现显存不足，队列将 microbatch 减为 4、累积增为 8，保持有效 batch 不变并记录。每次 optimizer update 保存 train loss，验证点单独记录。
+
+### 10.4 评估、生成与结果归档
+
+[`evaluate_dinr_beat.py`](../src/evaluate/evaluate_dinr_beat.py) 包含 valid 贪心诊断、teacher-forced 与 autoregressive 采样。测试保留 19 首作品和全部 82 个对齐参考演奏；每个模型三轮采样，temperature=1、top-p=0.9。TF 使用每个真实参考演奏作为历史；AR 只读取 score 和生成历史，绝不使用真实演奏属性。
+
+自回归使用不重叠的完整 beat 窗口，每窗最多 512 note；各窗起点重置 BOS/cache，累计 performance beat 时间跨窗延续。把不同窗口与采样轮次按固定顺序做 batch=16 解码以减少串行开销；随机流以作品标识固定，固定任务顺序和 batch 大小可重放。输出保存原始 token NPZ、事件身份、MIDI、逐作品和逐轮指标。
+
+Token JS 在 500-bin duration、500-bin onset 和 128-bin velocity 上计算，单位为 nats；误差与 beat anchor 还原始终保留 score event 对齐。播放 MIDI 按还原后的实际 onset 排序；若起音小于零，对整个片段做共同平移，不单独把提前音压到零。Legacy PN/PP W1 与 HR 另按 time-sorted MIDI note index 计算，并沿用旧的固定 human anchor；它与 event-aligned token 指标属于不同对齐协议，报告中明确区分。PP 保留 W1，不虚构未校准的 PP HR。
+
+[实验结果与曲线](exp1115_BEAT.md) 由队列自动刷新。主表对三个独立训练种子报告 mean ± sample std（小数三位），每个种子的 HR 先平均其三轮采样；CSV 另保留各模型采样标准差。曲线按 A/B/C/D 分为四列两行，横轴自适应该组实际最大 epoch。README 直接嵌入同一张图。
+
+### 10.5 监督运行与恢复
+
+队列入口为 [`run_dinr_beat_queue.py`](../script/run_dinr_beat_queue.py)，运行在 GPU0/1/2；每张卡一次一个任务，依次执行训练、valid、TF/AR 测试、指标归档和图表更新。manifest 保存 PID、心跳、阶段、退出码和自适应配置选择依据；禁止重复启动同一队列。评估可从已完成作品恢复，失败任务保留日志，依赖阶段不会把缺失结果当成完成。
+
+```bash
+cd INSPIRE2
+python -m src.data_process.build_dinr_beat_sidecars
+python script/audit_dinr_beat.py
+python -m unittest discover -s tests -p test_dinr_beat.py -v
+python script/run_dinr_beat_queue.py --gpus 0 1 2
+```
+
+运行目录为外层 `results/exp1115_beat/`；数据、checkpoint 和运行日志保存在本地，仅 INSPIRE2 内层仓库包含实现、审计、设计及结果文档，不提交外层仓库。

@@ -1,0 +1,16 @@
+setting,seed,status
+A1,42,training
+A1,43,queued
+A1,44,queued
+A2,42,training
+A2,43,queued
+A2,44,queued
+A3,42,training
+A3,43,queued
+A3,44,queued
+B1,42,queued
+B1,43,queued
+B1,44,queued
+B2,42,queued
+B2,43,queued
+B2,44,queued
