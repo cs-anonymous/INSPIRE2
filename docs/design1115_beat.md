@@ -1,12 +1,12 @@
 # 基于 Beat 的双级时间表示设计
 
-## 设计动机
+## 1. 设计动机
 
 当前逐音符时间目标用相邻音符或起音组之间的 IOI 表示时间。这样同一组和弦中的音符需要特殊的零 IOI 规则，而下一个起音组的时间还可能依赖音符排序。当前 score MIDI 在和弦内按音高排序，因此最低音可能意外地成为时间参照。
 
 新设计把 score 的节拍结构显式加入输入，并让 BEAT 同时承担 beat-duration 输出：**BEAT token 提供 score beat 网格、score beat duration 和小节起始标记，并在 beat 状态上预测 performance beat duration**；**NOTE token 预测演奏音符属性**。note onset 相对所属 performance beat 起点表示；弱起、切分或演奏提前都可能令它为负，因此比例必须允许负值，也不应硬限制在 `[0, 1]`。
 
-## 双级表示
+## 2. 双级表示
 
 记 `b` 为 score 中的拍编号，`T0_b` 为 score 中该拍的标准时长（毫秒），`B_b` 为演奏中按确定性规则选出的拍点时间。
 
@@ -31,7 +31,7 @@ $$
 
 其中 `B_b` 是模型还原出的 performance beat 起点。`u=0.10` 表示拍点后 10% performance beat duration，`u=-0.05` 表示早 5%，`u=1.10` 表示落在下一 beat 起点之后 10%，但音符仍按 score 对齐关系归属原 beat。`u` 是 note 相对 performance beat 的位置。
 
-## 双级比例统计（ScorePerformer beat 映射的初步结果）
+## 3. 双级比例统计（ScorePerformer beat 映射的初步结果）
 
 拍不是从演奏音符里挑一个“第一个音”。理论上的拍网格应由 score 的小节线、拍号和拍内分组确定：例如 4/4 通常以四分音符为拍，6/8 通常以附点四分音符为复合拍。即使该拍没有音符，beat token 仍存在；休止拍也不能删除，否则 score beat 的时间轴会断掉。
 
@@ -39,7 +39,7 @@ $$
 
 这个流程是已有的确定性 score-to-performance beat 映射，不训练 beat detector，也不额外拟合模型。需要注意，均值仍会把和弦内部的起音差异压成一个组时间，单调过滤也可能删除局部反向 pair；因此 note-level residual 仍混合演奏偏移、和弦内不同步及对齐噪声。下方比例应看作该标准流程下的诊断，不直接等同于演奏者提前/延后的真实发生率。
 
-### 一级：Beat duration
+### 3.1 Beat duration
 
 这里的 `beat duration` 明确定义为**当前 beat anchor 到下一个 beat anchor 的时间间距**。性能侧使用相邻 `get_performance_beats` 输出的差，score 侧使用相邻 score beat ticks 按 score tempo 换算出的时长。它不是 note-to-note IOI。
 
@@ -68,7 +68,7 @@ $$
 
 ![Score and performance beat duration, absolute and log](../analysis/design1115_score_perf_beat_duration_abs_log.png)
 
-### 二级：Note-token onset / 实际局部拍长
+### 3.2 Note-token onset / 实际局部拍长
 
 | 统计量 | 比例 |
 |---|---:|
@@ -102,11 +102,11 @@ $$
 
 `u<0` 表示 note 起音早于 ScorePerformer 映射出的所属 score beat 边界；`u>1` 表示它晚于下一拍边界。这些值是**未环绕的连续拍坐标**，不是限制在单拍内的相位角。大于 1 不会自动把音符重新归入下一拍，因为 note 仍按 score 对齐关系归属原拍。负值还包含同一 score onset group 内的和弦滚奏差异。
 
-### Note onset 范围建议
+### 3.3 Note onset 范围建议
 
-不要把 onset 强制限制在 `[0,1]`：当前约 24.79% 的样本小于 0，零点前后的负值是有意义的。若使用有界分类表示，建议主体区间设为 `[-0.25,1.0]`，两端各保留 underflow/overflow tail 类，不要把超界值直接裁到边界。该区间覆盖约 99.48% 样本；1%–99% 分位数为 `[-0.174,0.861]`。超界极值很少，但可能混有 beat 插值或对齐异常，保留 tail 可避免模型把异常极值当成常见边界值。若使用连续回归，则不必硬设有限输出范围，可用稳健损失控制极端残差。
+不要把 onset 强制限制在 `[0,1]`：当前约 24.79% 的样本小于 0，零点前后的负值是有意义的。首轮实验把 `[-0.25,1]` 均匀划分为 500 个 token，区间外值裁到最近端点并记录裁剪比例。该区间覆盖约 99.48% 样本；1%–99% 分位数为 `[-0.174,0.861]`。裁剪策略会损失少量尾部差异，后续可单独比较 tail-token 方案。
 
-## Duration 统计
+## 4. Duration 统计
 
 duration 以逐音符对齐的 score/performance 时值计算。定义时值比例和自然对数偏差：
 
@@ -133,16 +133,16 @@ ratio 图横轴显示 `[0,3]`，log deviation 图显示 `[-2,2]`；图内标注�
 
 ![Score and performance note duration, absolute and log](../analysis/design1115_score_perf_duration_abs_log.png)
 
-## Beat duration 与 note duration 的统一数值设计
+## 5. Beat duration 与 note duration 的统一数值设计
 
 BEAT 输入中的 score beat duration、BEAT 输出中的 performance beat duration、NOTE 输入中的 score note duration 和 NOTE 输出中的 performance note duration 都是正值时长，可以采用统一的 absolute-log 或 score-relative log-dev 数值设计。输入 embedding 仍使用 score-side absolute-log，输出 head 分别预测 beat 与 note 的 performance duration。
 
-可以比较以下两个统一协议：
+可以比较以下两个统一协议。绝对 log duration 使用自然对数毫秒值 `ln(D_ms)`。两种 duration 输出都使用 500 个数值 token；note onset 也固定使用 500 个数值 token，区间为 `[-0.25,1]`。
 
 | 协议 | encoder 输入 | decoder 历史输入 | beat/note 输出目标 | 建议主体区间 |
 |---|---|---|---|---|
 | Absolute-log | `ln(D_score)`，包括 beat 和 note duration | `ln(D_perf_previous)` | `ln(D_perf)` | `[3,8]` |
-| Score-relative log-dev | `ln(D_score)`，包括 beat 和 note duration | `ln(D_perf_previous)` | `ln(D_perf)-ln(D_score)` | `[-3,2]` |
+| Score-relative log-dev | `ln(D_score)`，包括 beat 和 note duration | `ln(D_perf_previous)` | `ln(D_perf)-ln(D_score)` | `[-2,3]` |
 
 Absolute-log 的优点是 encoder、decoder 输入和 duration 输出处于完全相同的语义空间，输出可以直接量化后回馈给下一步 decoder。Score-relative log-dev 的优点是输出只表达相对于 score duration 的演奏偏差，减少曲目速度和时值本身的变化；但它的输出不能直接作为下一步 decoder 的输入。生成时应先还原：
 
@@ -155,7 +155,7 @@ $$
 
 再把还原后的 `ln(D_perf)` 量化并作为历史 decoder 输入。beat head 和 note duration head 都可以使用同一还原公式；beat head 的输出用于累积得到 `B_b`，note onset 再相对这些 beat anchors 计算。
 
-两种协议都应保留 underflow/overflow tail，而不是把区间外样本静默裁到边界。`[3,8]` 与 `[-3,2]` 可以先作为主体区间；最终边界应只由 train split 决定，并在 valid/test 报告 tail 比例。
+首轮协议严格使用 500 个 bins：`[3,8]`、`[-2,3]` 和 `[-0.25,1]` 均匀分箱，区间外样本裁到最近端点。裁剪比例必须单独记录；后续可以增加 tail-token 版本，但不与首轮 500-token 结果混合比较。
 
 输入的 absolute-log 时长词表可以采用两种消融：
 
@@ -166,7 +166,7 @@ score/performance absolute-log 输入词表可以在 beat 与 note duration 之�
 
 统计协议、分位数和逐曲目结果见 [`../analysis/design1115_beat_stats.json`](../analysis/design1115_beat_stats.json)，可由 [`../../script/analyze_beat_relative_onsets.py`](../../script/analyze_beat_relative_onsets.py) 重算。当前分析直接使用 score MIDI 的 time signature 生成 beat 网格。
 
-## Token 与解码结构
+## 6. Token 与解码结构
 
 不额外使用 `BAR` token。小节边界直接编码为 beat 的二值属性 `measure_start`，因此 encoder 输入和 decoder 目标序列都包含 beat 和 note 两种事件：
 
@@ -208,15 +208,15 @@ encoder 输入和 decoder 目标都包含 beat 与 note，因此一个 window �
 
 同一拍内的和弦音共享拍坐标，不再以最低音或前一个和弦音作起音锚点。note onset 标签彼此独立地相对 beat 起点计算；生成后按还原出的绝对起音时间排序 MIDI。
 
-## 采用的现有流程
+## 7. 采用的现有流程
 
 不另行实现 beat detector。复用仓库已有的 ScorePerformer `get_bar_beat_ticks` 与 `get_performance_beats`：前者按 score 拍号生成拍网格；上游把同 musical onset 的已演奏音符聚合成一个 onset pair，当前 ScorePerformer SPMuple 实现取这些音符 performance onset 的均值；后者在 beat 边界精确命中 onset pair 时取对应时间，否则在相邻 pair 之间线性插值，并可启用单调时间过滤。
 
 因此它不会在一个 chord 中挑最低音或第一条 note 来代表整拍。onset 组聚合的均值仍可能受和弦滚奏影响，但确定且无 pitch-order bias。对于 score beat 落在两个 onset groups 之间、或该拍没有音符的情况，线性映射给出其 performance 时间，不需要为每拍找一个真实 note。
 
-在当前方案中，beat-duration head 预测 beat duration，note onset 头使用连续分布或有序离散分布预测带符号的 `u`，note-duration 头预测 `ln(D^{perf}/D^{score})` 并按 score 时值还原。若 onset 使用 DINR 分类表，主体 bin 建议覆盖 `[-0.25,1]` 并显式包含两侧 tail；其他 bin 边界只能由 train split 决定。若使用 CINR 连续头，仍需对错配标签做稳健处理。
+在当前方案中，beat-duration head 预测 beat duration，note onset 头使用 500-bin 有序离散分布预测带符号的 `u`，note-duration 头预测 `ln(D^{perf}/D^{score})` 并按 score 时值还原。onset 固定使用 `[-0.25,1]`，区间外值裁到端点并记录比例；若后续使用连续头，仍需对错配标签做稳健处理。
 
-## 相关符号生成方法
+## 8. 相关符号生成方法
 
 - **REMI / Pop Music Transformer**（Huang & Yang, 2020）用 `Bar`、`Position`、`Tempo` 等事件显式表示小节、拍内位置和速度，再生成音符。它支持把 metrical structure 明确放进序列；REMI 的 `Position` 是小节内量化位置，本设计的 `u` 则表达对齐演奏拍点后的连续、可带符号偏移。
 - **Compound Word Transformer**（Hsiao et al., 2021）将相关符号字段组合为 compound event，并建模小节结构。它支持在保留结构上下文的同时组合音符属性，但本身并未提出这里的带符号演奏起音比例。
@@ -224,14 +224,76 @@ encoder 输入和 decoder 目标都包含 beat 与 note，因此一个 window �
 
 这些工作支持“显式表示 beat 结构”的设计动机，但不能证明本方案已经有效。需要实验检验的假设是：把 score beat 结构作为输入上下文，是否能提升 note-level 演奏属性的建模并简化起音目标学习。
 
-## 与当前 IOI 的关系及实验计划
+## 9. 实验队列与比较设置
 
 当前 IOI 以相邻音符或起音组为参照；新方案以 score beat 网格作为显式输入，同时预测 beat-level performance duration 和 note 相对 beat 的起音位置。它让同拍和弦使用统一坐标，并显式建模 performance tempo curve，但不保证 HR、Wasserstein 或听感一定变好。
 
-1. **标签审计：** 复用现有 score-to-performance beat 映射，检查两级比例的分布、异常样例及不同演奏间的稳定性。
-2. **匹配对照：** 当前 timestep 模型与两级 beat 模型使用相同 split、初始化策略、训练预算和采样种子。
-3. **消融：** 无 beat token；加入 beat token；加入或移除 `measure_start`；beat/note duration 使用 shared 或 separate 输入词表；absolute-log 与 log-dev 输出目标。
-4. **评估：** 报告 valid loss、beat duration 误差、signed onset 误差、note duration 误差、还原后的 token-level timing JS、PP/PN 和 HR；同时检查 teacher-forced 与 autoregressive 输出。
-5. **重建检查：** 验证 score beat 到 note 的归属、note 绝对起音、跨拍顺序、音符对齐、拍号变化、弱起、休止，以及 `u<0` 或 `u>1` 的音符。
+### 9.1 固定协议
+
+所有队列使用相同的数据划分、窗口上限、优化器、学习率、训练 epoch、early stopping 和随机种子组。窗口以 note 数量为主约束，首 token 为 `BEAT`，末 token 为 `NOTE`，不能在一个 beat 的 note 集合中间切割。
+
+数值目标固定为 500 个 bins：
+
+| 目标 | 数值空间 | bins | 说明 |
+|---|---|---:|---|
+| Beat/note duration absolute-log | `[3,8]` | 500 | 输出 `ln(D_perf)`，输入 score 和 decoder 历史仍为 absolute-log |
+| Beat/note duration score-relative log-dev | `[-2,3]` | 500 | 输出 `ln(D_perf)-ln(D_score)`，生成后加回 score log |
+| Note onset | `[-0.25,1]` | 500 | 相对 performance beat 的 signed onset ratio |
+
+这里的“统一 500 token”表示 bin 数和离散化协议一致，不表示三种语义必须共享同一张 embedding 表。duration 的 beat/note 表共享是一个实验因素；onset 语义不同，默认使用独立表。区间外值首轮裁到端点，并报告裁剪比例。
+
+### 9.2 队列 A：结构与输出目标
+
+| 编号 | Beat token | `measure_start` | Duration target | Duration 输入表 | Duration 输出 head | 目的 |
+|---|---|---|---|---|---|---|
+| A0 | 无 | 无 | 现有 note-only IOI/属性目标 | 现有配置 | 现有 head | legacy 端到端基线，不作为单因素对照 |
+| A1 | 有 | 有 | absolute-log | beat/note shared | beat/note separate | 默认 beat 结构基线 |
+| A2 | 有 | 有 | log-dev | beat/note shared | beat/note separate | 比较 absolute-log 与 score-relative target |
+| A3 | 有 | 无 | absolute-log | beat/note shared | beat/note separate | `measure_start` 消融 |
+
+A0 提供现有系统的端到端参照，但因 note-only 目标与 beat 目标不同，不是严格的单因素对照。A1 与 A2 判断输出采用 absolute-log 还是 log-dev；A1 与 A3 判断小节第一拍标记是否提供额外信息。A1、A2、A3 均使用相同的三个随机种子组。
+
+### 9.3 队列 B：duration 输入表共享
+
+在 A1 和 A2 中分别把 duration 输入表从 shared 改成 separate：
+
+| 编号 | 结构 | Duration target | Duration 输入表 | 输出 head |
+|---|---|---|---|---|
+| B1 | beat + `measure_start` | absolute-log | beat/note separate | separate |
+| B2 | beat + `measure_start` | log-dev | beat/note separate | separate |
+
+B1 对比 A1，B2 对比 A2。separate 表示 beat 与 note 各有自己的 500-token 输入表；score 输入与 decoder 历史输入在各自事件类型内使用相同表。该组只检验 beat duration 与 note duration 是否应共享输入 embedding；输出 head 保持 separate，避免混淆参数共享因素。
+
+### 9.4 队列 C：duration 输出 head 共享
+
+固定 A1 或 A2 中表现更好的 target 和输入表，比较：
+
+| 编号 | Duration 输出 head | 类型条件 | 目的 |
+|---|---|---|---|
+| C1 | beat/note separate | 无需额外条件 | 默认方案 |
+| C2 | shared projection | 保留 type-conditioned bias/role projection | 检验输出参数共享 |
+| C3 | 完全 shared projection | 无 role projection | 极限参数共享对照 |
+
+C2 是可行的共享方案；C3 只作为诊断，不作为默认实现，因为 beat tempo 和 note articulation 的条件分布不同。
+
+### 9.5 队列 D：第二阶段交互实验
+
+只有在 A–C 得到稳定结果后再运行以下组合，避免在第一轮形成过大的笛卡尔积：
+
+1. **D1：** beat duration 使用 absolute-log、note duration 使用 log-dev；
+2. **D2：** beat duration 使用 log-dev、note duration 使用 absolute-log；
+3. **D3：** shared duration 输入表与 separate 输出 head 的最佳组合；
+4. **D4：** separate duration 输入表与 shared type-conditioned 输出 head 的最佳组合；
+5. **D5：** 加入或移除 `measure_start` 的最佳组合复验。
+
+这组用于判断 beat tempo 与 note articulation 是否需要不同的 target 表示；若 A1/A2 已显示统一 target 明显更好，D1/D2 可以取消。
+
+### 9.6 评估与选择规则
+
+每个设置至少使用三个随机种子。报告 valid loss、beat duration log/ratio 误差、note onset token accuracy 与 signed error、note duration 误差、生成后的 token-level timing JS、PP/PN 和 HR；同时检查 teacher-forced 与 autoregressive 输出。
+
+模型选择不只看总 valid loss。先确认 beat duration、note onset、note duration 三个 head 均没有明显退化，再比较 autoregressive timing JS、beat anchor 重建误差和 HR。若 valid loss 与 HR 或 JS 方向不一致，保留全部指标，不用单一指标强行排序。
+
+窗口重建必须验证 score beat 到 note 的归属、performance beat anchors 的连续性、note 绝对起音、跨 beat 顺序、音符对齐、拍号变化、弱起、休止，以及 `u<0` 或 `u>1` 的音符。
 
 不能只凭 valid loss 选型；此前实验已观察到 loss 与 HR 不总是同向。首要检验点是两级时间表示是否更清晰且更易学习，质量结论仍需多随机种子及 held-out 指标支持。
