@@ -34,6 +34,18 @@ class DINRTokenSpec:
     vocab_size = pedal_start + 2
 
     @classmethod
+    def configure_timing(cls, bins=500, bin_ms=10):
+        cls.timing_bins = int(bins)
+        cls.timing_bin_ms = int(bin_ms)
+        if cls.timing_bins < 2 or cls.timing_bin_ms < 1:
+            raise ValueError("timing bins must be >= 2 and bin_ms must be >= 1")
+        cls.max_timing_ms = cls.timing_bins * cls.timing_bin_ms
+        cls.velocity_start = cls.pitch_start + cls.velocity_bins
+        cls.timing_start = cls.velocity_start + cls.velocity_bins
+        cls.pedal_start = cls.timing_start + cls.timing_bins
+        cls.vocab_size = cls.pedal_start + 2
+
+    @classmethod
     def note_to_tokens(cls, pitch, ioi, duration, velocity, pedal):
         timing_i = int(round(float(ioi) / cls.timing_bin_ms))
         timing_d = int(round(float(duration) / cls.timing_bin_ms))
@@ -161,6 +173,10 @@ class DINRAbsoluteDataset(Dataset):
                 )
             if self.precomputed.get("block_notes") != self.block_notes or self.precomputed.get("overlap_ratio") != self.overlap_ratio:
                 raise ValueError("Precomputed token windows do not match block_notes/overlap_ratio")
+            if self.precomputed.get("timing_bins", DINRTokenSpec.timing_bins) != DINRTokenSpec.timing_bins:
+                raise ValueError("Precomputed timing bins do not match DINRTokenSpec")
+            if self.precomputed.get("timing_bin_ms", DINRTokenSpec.timing_bin_ms) != DINRTokenSpec.timing_bin_ms:
+                raise ValueError("Precomputed timing resolution does not match DINRTokenSpec")
             self.samples = self.precomputed["samples"]
             return
         sidecars = _sidecar_paths(self.root)

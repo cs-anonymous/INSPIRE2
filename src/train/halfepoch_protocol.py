@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from pathlib import Path
 
 from transformers import Trainer, TrainerCallback
@@ -49,6 +50,60 @@ class BestOnlyCheckpointMixin:
 
 class BestOnlyTrainer(BestOnlyCheckpointMixin, Trainer):
     best_only_checkpoints = True
+
+
+class EpochDiagnosticTrainer(BestOnlyTrainer):
+    """Retain every validation checkpoint and track unrounded online train loss."""
+
+    best_only_checkpoints = False
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        result = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        if model.training:
+            loss = result[0] if return_outputs else result
+            epoch = math.floor(float(self.state.epoch or 0.0) + 1e-8) + 1
+            if not hasattr(self, "epoch_train_losses"):
+                self.epoch_train_losses = {}
+            stats = self.epoch_train_losses.setdefault(epoch, dict(weighted_loss=0.0, examples=0, batches=0))
+            size = int(inputs["score_tokens"].shape[0])
+            stats["weighted_loss"] += float(loss.detach().float()) * size
+            stats["examples"] += size
+            stats["batches"] += 1
+        return result
+
+    def _determine_best_metric(self, metrics, trial):
+        if not math.isfinite(float(metrics["eval_loss"])):
+            raise ValueError("Validation loss is not finite")
+        improved = super()._determine_best_metric(metrics, trial)
+        self.control.should_save = True
+        return improved
+
+
+class EpochDiagnosticCallback(TrainerCallback):
+    """Publish checkpoint readiness only after Trainer has finished saving it."""
+
+    trainer = None
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        epoch = float(state.epoch)
+        stats = self.trainer.epoch_train_losses[math.ceil(epoch - 1e-8)]
+        self.latest = dict(epoch=epoch, step=state.global_step,
+                           train_loss_epoch_mean=stats["weighted_loss"] / stats["examples"],
+                           train_examples=stats["examples"], train_batches=stats["batches"],
+                           train_loss_scope="current epoch only; sample-weighted online masked loss",
+                           valid_loss=float(metrics["eval_loss"]),
+                           full_epoch=abs(epoch - round(epoch)) < 1e-8)
+
+    def on_save(self, args, state, control, **kwargs):
+        if not args.should_save:
+            return
+        checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        shutil.copyfile(Path(args.output_dir) / "dinr_config.json", checkpoint / "dinr_config.json")
+        record = {**self.latest, "checkpoint": str(checkpoint.resolve())}
+        ready = checkpoint / "epoch_diagnostic.json"
+        temporary = ready.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(record, indent=2) + "\n")
+        temporary.replace(ready)
 
 
 class LiveLossHistoryCallback(TrainerCallback):

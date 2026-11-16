@@ -22,6 +22,7 @@ from src.model.pianoformer import (
     PianoT5GemmaModel,
 )
 from src.data_process.dinr_dataset import DINRTokenSpec
+from src.data_process.dinr_beat_dataset import BeatTokenSpec
 
 
 MASKED_ATTRIBUTE_SLOTS = (1, 2, 3)
@@ -81,7 +82,8 @@ class DINRAbsoluteModel(nn.Module):
                  num_input_slots=None, separate_ioi_duration_tables=False,
                  timing_target_mode="absolute", time_input_mode="linear",
                  coordinate_encoding="fourier", coordinate_hidden_size=32,
-                 separate_coordinate_projections=False, coordinate_combination="add"):
+                 separate_coordinate_projections=False, coordinate_combination="add",
+                 decoder_input_pitch=True):
         super().__init__()
         self.config = config or PianoT5GemmaConfig()
         self.pedal_mode = str(pedal_mode).lower()
@@ -111,6 +113,13 @@ class DINRAbsoluteModel(nn.Module):
         self.time_input_mode = str(time_input_mode)
         expected_slots = 4 if self.pedal_mode == "none" else 8
         self.num_input_slots = expected_slots if num_input_slots is None else int(num_input_slots)
+        self.decoder_input_pitch = bool(decoder_input_pitch)
+        self.decoder_num_input_slots = self.num_input_slots if self.decoder_input_pitch else 3
+        if not self.decoder_input_pitch and (
+            self.pedal_mode != "none" or self.num_input_slots != 4
+            or self.decoder_mask_mode != "note"
+        ):
+            raise ValueError("E4D3 requires four encoder slots, no pedals, and note/timestep mask")
         if not 0.0 <= self.decoder_mask_probability < 1.0:
             raise ValueError("decoder_mask_probability must be in [0, 1)")
         if self.pedal_mode not in {"ce", "bce", "none"}:
@@ -332,6 +341,23 @@ class DINRAbsoluteModel(nn.Module):
             embeds = torch.stack(slot_embeddings, dim=2)
         return embeds.sum(dim=2)
 
+    def _decoder_tokens_with_slots(self, tokens):
+        """Adapt E4D3 feedback to the existing field-specific embedding slots.
+
+        Datasets retain four columns for compatibility; inference supplies the
+        three generated numeric columns. Neither path embeds decoder pitch.
+        PAD in slot zero contributes exactly zero, including for BOS notes.
+        """
+        if self.decoder_input_pitch:
+            return tokens
+        if tokens.ndim != 3 or tokens.shape[-1] not in (3, 4):
+            raise ValueError("E4D3 decoder tokens must have three numeric columns or four dataset columns")
+        numeric = tokens[..., 1:] if tokens.shape[-1] == 4 else tokens
+        return torch.cat((torch.full_like(numeric[..., :1], DINRTokenSpec.pad_id), numeric), dim=-1)
+
+    def _sum_decoder_tokens(self, tokens):
+        return self._sum_note_tokens(self._decoder_tokens_with_slots(tokens))
+
     def _mask_decoder_attributes(self, decoder_tokens, decoder_attention_mask):
         if (not self.training or self.decoder_mask_mode not in {"attribute", "timestep"}
                 or self.decoder_mask_probability <= 0.0 or decoder_tokens.shape[1] <= 1):
@@ -403,7 +429,8 @@ class DINRAbsoluteModel(nn.Module):
         use_cache=False,
         cache_position=None,
     ):
-        score_embeds = self._sum_note_tokens(score_tokens)
+        score_embeds = None if encoder_outputs is not None else self._sum_note_tokens(score_tokens)
+        decoder_tokens = self._decoder_tokens_with_slots(decoder_tokens)
         if attention_mask is None:
             attention_mask = score_tokens.new_ones(score_tokens.shape[:2])
         if decoder_attention_mask is None:
@@ -482,11 +509,12 @@ class DINRAbsoluteModel(nn.Module):
                 "encoder_outputs": BaseModelOutput(last_hidden_state=outputs.encoder_last_hidden_state),
                 "past_key_values": outputs.past_key_values}
 
-    def save_pretrained(self, output_dir, state_dict=None, **kwargs):
+    def save_pretrained(self, output_dir, state_dict=None, save_weights=True, **kwargs):
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(self.state_dict() if state_dict is None else state_dict,
-                   output_dir / "pytorch_model.bin")
+        if save_weights:
+            torch.save(self.state_dict() if state_dict is None else state_dict,
+                       output_dir / "pytorch_model.bin")
         if hasattr(self.config, "save_pretrained"):
             self.config.save_pretrained(output_dir)
         (output_dir / "dinr_config.json").write_text(
@@ -507,12 +535,16 @@ class DINRAbsoluteModel(nn.Module):
                 "separate_ioi_duration_tables": self.separate_ioi_duration_tables,
                 "decoder_mask_probability": self.decoder_mask_probability,
                 "decoder_mask_mode": self.decoder_mask_mode,
+                "decoder_input_pitch": self.decoder_input_pitch,
+                "decoder_num_input_slots": self.decoder_num_input_slots,
                 "decoder_attribute_mask_embeddings": "three slot-specific learned vectors",
                 "decoder_attribute_mask_init_std": self.config.initializer_range,
                 "timing_target_mode": self.timing_target_mode,
                 "time_input_mode": self.time_input_mode,
                 "num_input_slots": self.num_input_slots,
                 "vocab_size": DINRTokenSpec.vocab_size,
+                "timing_bins": DINRTokenSpec.timing_bins,
+                "timing_bin_ms": DINRTokenSpec.timing_bin_ms,
             }, indent=2),
             encoding="utf-8",
         )

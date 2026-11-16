@@ -16,6 +16,26 @@ from src.train.halfepoch_protocol import BestOnlyTrainer, HalfEpochValidationCal
 
 
 class BeatTrainer(BestOnlyTrainer):
+    normalize_partial_accumulation = False
+
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        samples, items = super().get_batch_samples(epoch_iterator, num_batches, device)
+        self.actual_accumulation_steps = max(1, len(samples))
+        return samples, items
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        result = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        if model.training and self.normalize_partial_accumulation:
+            # Trainer 4.54 divides by configured G in training_step, including
+            # the partial last update. Restore averaging over its actual r
+            # microbatches for both backward and logged loss. Eval is unchanged.
+            factor = self.args.gradient_accumulation_steps / self.actual_accumulation_steps
+            if return_outputs:
+                result = (result[0] * factor, result[1])
+            else:
+                result = result * factor
+        return result
+
     def _save(self, output_dir=None, state_dict=None):
         self.model.save_pretrained(output_dir or self.args.output_dir)
 
@@ -35,6 +55,9 @@ def main():
     parser.add_argument("--epochs", type=float, default=16)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--fixed-event-length", type=int)
+    parser.add_argument("--normalize-partial-accumulation", action="store_true")
+    parser.add_argument("--beat-type-embedding", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -74,7 +97,9 @@ def main():
     )
     model = DINRBeatModel(config, args.duration_target,
                           args.duration_input_tables, args.duration_output_head,
-                          args.decoder_mask_probability)
+                          args.decoder_mask_probability,
+                          use_beat_type_embedding=args.beat_type_embedding,
+                          measure_start_vocab_size=2 if args.measure_start or args.beat_type_embedding else 1)
     model.beat_duration_target = beat_target
     model.note_duration_target = note_target
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +116,9 @@ def main():
         "onset_bins": 500,
         "onset_range": [-0.25, 1.0],
         "initialization": "random",
+        "window_events": train.data.get("window_events"),
+        "window_policy": train.data.get("window_policy", "whole_beat_note_cap"),
+        "measure_start_vocab_size": model.measure_start_vocab_size,
     })
     (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, default=str) + "\n")
     training_args = TrainingArguments(
@@ -125,11 +153,12 @@ def main():
         args=training_args,
         train_dataset=train,
         eval_dataset=valid,
-        data_collator=DINRBeatCollator(),
+        data_collator=DINRBeatCollator(args.fixed_event_length),
         callbacks=[HalfEpochValidationCallback(),
                    EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
                    LiveLossHistoryCallback()],
     )
+    trainer.normalize_partial_accumulation = args.normalize_partial_accumulation
     trainer.train()
     trainer.save_model(str(args.output_dir / "best"))
     trainer.state.save_to_json(str(args.output_dir / "trainer_state.json"))

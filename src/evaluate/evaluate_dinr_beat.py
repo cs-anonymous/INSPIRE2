@@ -17,7 +17,7 @@ from scipy.special import rel_entr
 from scipy.stats import wasserstein_distance
 from miditoolkit import Instrument, MidiFile, Note, TempoChange
 
-from src.data_process.dinr_beat_dataset import BeatTokenSpec as S, DINRBeatDataset, DINRBeatCollator
+from src.data_process.dinr_beat_dataset import BeatTokenSpec as S, DINRBeatDataset, DINRBeatCollator, fixed_event_spans
 from src.model.dinr_beat import DINRBeatModel
 from src.model.pianoformer import PianoT5GemmaConfig
 
@@ -44,7 +44,9 @@ def load_model(checkpoint, device):
         num_attention_heads=run['attention_heads'], num_key_value_heads=run['key_value_heads'],
         head_dim=run['head_dim'])
     model = DINRBeatModel(config, run['duration_target'], run['duration_input_tables'],
-                          run['duration_output_head'], run.get('decoder_mask_probability', .5))
+                          run['duration_output_head'], run.get('decoder_mask_probability', .5),
+                          use_beat_type_embedding=run.get('beat_type_embedding', True),
+                          measure_start_vocab_size=run.get('measure_start_vocab_size', 2))
     model.beat_duration_target = run['beat_duration_target']
     model.note_duration_target = run['note_duration_target']
     model.load_state_dict(torch.load(checkpoint / 'pytorch_model.bin', map_location='cpu', weights_only=True))
@@ -83,8 +85,10 @@ def draw(logits, generator, temperature=1., top_p=.9):
     return indices.gather(-1, selected).squeeze(-1)
 
 
-def event_chunks(events, limit=512):
+def event_chunks(events, limit=512, max_events=None):
     """Nonoverlapping, whole-beat chunks; no more than limit notes."""
+    if max_events is not None:
+        return fixed_event_spans(len(events), max_events)
     types = events[:,0].long()
     last_note = torch.nonzero(types == S.note_type).flatten()
     if not len(last_note):
@@ -120,21 +124,28 @@ def quantized_example(events, targets, run):
 @torch.inference_mode()
 def predict(model, events, targets, run, device, seed, teacher_forced=False, greedy=False):
     generator = torch.Generator(device=device).manual_seed(seed)
-    chunks = event_chunks(events, run.get('window_notes',512))
+    chunks = event_chunks(events, run.get('window_notes',512), run.get('window_events'))
     results = []
     for left,right in chunks:
         source = events[left:right]
         example = quantized_example(source, targets[left:right], run)
-        encoder = example['encoder_tokens'][None].to(device)
-        types = example['event_types'][None].to(device)
-        attention = torch.ones_like(types)
+        if run.get('fixed_event_length'):
+            batch = {k:v.to(device) for k,v in DINRBeatCollator(run['fixed_event_length'])([example]).items()}
+            encoder, types, attention = batch['encoder_tokens'], batch['event_types'], batch['attention_mask']
+            decoder = batch['decoder_tokens']
+        else:
+            encoder = example['encoder_tokens'][None].to(device)
+            types = example['event_types'][None].to(device)
+            attention = torch.ones_like(types)
+            decoder = example['decoder_tokens'][None].to(device)
         with amp(device):
             if teacher_forced:
-                output = model(encoder_tokens=encoder, decoder_tokens=example['decoder_tokens'][None].to(device),
-                               event_types=types, attention_mask=attention)
+                output = model(encoder_tokens=encoder, decoder_tokens=decoder,
+                               event_types=types, attention_mask=attention,
+                               decoder_attention_mask=attention)
                 predicted = []
                 for key in ('duration','onset','velocity'):
-                    logits = output['logits'][key][0]
+                    logits = output['logits'][key][0,:len(source)]
                     predicted.append(logits.argmax(-1) if greedy else draw(logits,generator))
                 results.append(torch.stack(predicted,dim=-1).cpu())
                 continue
@@ -165,7 +176,7 @@ def predict(model, events, targets, run, device, seed, teacher_forced=False, gre
 @torch.inference_mode()
 def predict_many(model, events, targets, run, device, seeds, batch_size=16):
     """Batch independent complete-beat windows and sampling draws for AR."""
-    chunks = event_chunks(events,run.get('window_notes',512))
+    chunks = event_chunks(events,run.get('window_notes',512),run.get('window_events'))
     tasks = [(sample,left,right) for sample in range(len(seeds)) for left,right in chunks]
     pieces = [[] for _ in seeds]
     # Fixed task order and batch size are part of the replay protocol.
@@ -174,7 +185,7 @@ def predict_many(model, events, targets, run, device, seeds, batch_size=16):
         group = tasks[offset:offset+batch_size]
         examples = [quantized_example(events[left:right],targets[left:right],run)
                     for _,left,right in group]
-        batch = {k:v.to(device) for k,v in DINRBeatCollator()(examples).items()}
+        batch = {k:v.to(device) for k,v in DINRBeatCollator(run.get('fixed_event_length'))(examples).items()}
         encoder,types,attention = batch['encoder_tokens'],batch['event_types'],batch['attention_mask']
         size,length = types.shape
         raw = torch.ones((size,length,6),device=device)
@@ -185,7 +196,8 @@ def predict_many(model, events, targets, run, device, seeds, batch_size=16):
         cache,predicted = None,[]
         with amp(device):
             encoded = model.backbone.encoder(inputs_embeds=model._sum_events(encoder),attention_mask=attention)
-            for i in range(length):
+            decode_length = max(right-left for _,left,right in group)
+            for i in range(decode_length):
                 output=model(encoder_tokens=encoder,decoder_tokens=previous,event_types=types[:,i:i+1],
                              attention_mask=attention,decoder_attention_mask=attention[:,:i+1],
                              encoder_outputs=encoded,use_cache=True,past_key_values=cache,
@@ -261,6 +273,8 @@ def token_metrics(tokens, reference_tokens, events, continuous, reference):
     result = {}
     for name,mask,col,bins in (('beat_duration',beat,0,500),('note_duration',~beat,0,500),
                                ('onset',~beat,1,500),('velocity',~beat,2,128)):
+        if not mask.any():
+            continue
         pred, ref = tokens.numpy()[mask,col], reference_tokens.numpy()[mask,col]
         result[name+'_accuracy'] = float(np.mean(pred == ref))
         result[name+'_js'] = js_counts(pred,ref,bins)
@@ -272,11 +286,15 @@ def token_metrics(tokens, reference_tokens, events, continuous, reference):
             error = continuous[mask,col]-reference[mask,col]
             result[name+'_mae'] = float(np.abs(error).mean())
             result[name+'_signed_error'] = float(error.mean())
-    _,pred_anchors = absolute_notes(events,continuous)
-    _,ref_anchors = absolute_notes(events,reference)
-    result['beat_anchor_mae_ms'] = float(np.abs(pred_anchors-ref_anchors).mean())
-    result['selection_score'] = (result['beat_duration_log_mae'] + result['note_duration_log_mae']
-                                 + result['onset_mae'] + result['velocity_mae']/127)/4
+    # Window-local diagnostics also allow NOTE-first or NOTE-only windows.
+    # Absolute note reconstruction is meaningful on the reassembled work.
+    if beat.any():
+        pred_anchors = np.r_[0.,np.cumsum(continuous[beat,0])[:-1]]
+        ref_anchors = np.r_[0.,np.cumsum(reference[beat,0])[:-1]]
+        result['beat_anchor_mae_ms'] = float(np.abs(pred_anchors-ref_anchors).mean())
+    if all(k in result for k in ('beat_duration_log_mae','note_duration_log_mae','onset_mae','velocity_mae')):
+        result['selection_score'] = (result['beat_duration_log_mae'] + result['note_duration_log_mae']
+                                     + result['onset_mae'] + result['velocity_mae']/127)/4
     return result
 
 
@@ -288,7 +306,7 @@ def evaluate_valid(model,run,path,device,limit=None):
         ex = dataset[i]
         start,end = dataset.samples[i]['span']
         events,reference = dataset.data['events'][start:end],dataset.data['targets'][start:end].numpy()
-        batch = {k:v.to(device) for k,v in DINRBeatCollator()([ex]).items()}
+        batch = {k:v.to(device) for k,v in DINRBeatCollator(run.get('fixed_event_length'))([ex]).items()}
         with amp(device):
             output = model(**batch)
         losses.append(float(output['loss']))
@@ -298,8 +316,11 @@ def evaluate_valid(model,run,path,device,limit=None):
         ref_tokens = torch.stack((torch.where(ex['event_types']==0,labels[:,0],labels[:,1]),
                                   labels[:,2].clamp_min(0),labels[:,3].clamp_min(0)),dim=-1)
         rows.append(token_metrics(tokens,ref_tokens,events,to_continuous(tokens,events,model),reference))
-    return dict(windows=len(rows),loss=float(np.mean(losses)),
-                metrics={k:float(np.mean([r[k] for r in rows])) for k in rows[0]})
+    metrics = {k:float(np.mean([r[k] for r in rows if k in r]))
+               for k in set().union(*(r.keys() for r in rows))}
+    metrics['selection_score'] = (metrics['beat_duration_log_mae'] + metrics['note_duration_log_mae']
+                                  + metrics['onset_mae'] + metrics['velocity_mae']/127)/4
+    return dict(windows=len(rows),loss=float(np.mean(losses)),metrics=metrics)
 
 
 def reference_tokens(events,targets,run):
@@ -326,7 +347,7 @@ def evaluate_test(model,run,path,device,output,samples=3,limit=None):
             continue
         first_start,first_end = performances[0]['span']
         events = payload['events'][first_start:first_end]
-        chunks = event_chunks(events,run.get('window_notes',512))
+        chunks = event_chunks(events,run.get('window_notes',512),run.get('window_events'))
         length = chunks[-1][1]
         events = events[:length]
         references, reference_token_arrays, reference_midis = [],[],[]
@@ -387,7 +408,9 @@ def evaluate_test(model,run,path,device,output,samples=3,limit=None):
     return dict(works=len(work_rows),samples=samples,rounds=rounds,work_rows=work_rows,
                 hr_protocol='legacy MIDI time-sorted note-index PN W1 / exp1112 fixed anchors; average per work',
                 token_protocol='exact raw output token, score event identity retained; JS in nats',
-                generation_protocol='whole beat nonoverlapping windows <=512 notes; BOS/cache reset per window; beat timeline continuous; AR task batch size 16; deterministic work RNG shared across draws')
+                generation_protocol=('fixed 512 total-event chunks; beat may be split; tail padded; BOS/cache reset per window; reassemble original event order before global beat timeline reconstruction; AR task batch size 16; deterministic work RNG shared across draws'
+                                     if run.get('window_events') else
+                                     'whole beat nonoverlapping windows <=512 notes; BOS/cache reset per window; beat timeline continuous; AR task batch size 16; deterministic work RNG shared across draws'))
 
 
 def main():

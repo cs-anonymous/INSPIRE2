@@ -51,8 +51,16 @@ BASE=[spec('A1'),spec('A2',target='log_dev'),spec('A3',measure=False),
 
 
 class Supervisor:
-    def __init__(self,run_dir,gpus):
+    def __init__(self,run_dir,gpus,*,data_dir=DATA,sidecar_tag='b512_o50',batch_size=8,
+                 accumulation=4,fixed_event_length=None,normalize_partial=False,
+                 beat_type_embedding=True,experiment='exp1115'):
         self.run_dir,self.gpus=run_dir,gpus
+        self.data_dir,self.sidecar_tag=data_dir,sidecar_tag
+        self.batch_size,self.accumulation=batch_size,accumulation
+        self.fixed_event_length=fixed_event_length
+        self.normalize_partial=normalize_partial
+        self.beat_type_embedding=beat_type_embedding
+        self.experiment=experiment
         self.lock=threading.RLock()
         self.manifest_path=run_dir/'manifest.json'
         self.manifest=(json.loads(self.manifest_path.read_text()) if self.manifest_path.exists() else
@@ -76,7 +84,7 @@ class Supervisor:
             self.last_report=time.monotonic()
             with (self.run_dir/'report.log').open('a') as log:
                 result=subprocess.run([sys.executable,str(ROOT/'script/report_dinr_beat.py'),
-                                       '--campaign',str(self.run_dir)],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+                                       '--campaign',str(self.run_dir),'--experiment',self.experiment],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
                 if result.returncode:
                     print('Report generation failed; see report.log',flush=True)
         finally:
@@ -126,11 +134,11 @@ class Supervisor:
         try:
             summary_path=directory/'training_summary.json'
             if not summary_path.exists():
-                batch,accumulation=8,4
+                batch,accumulation=self.batch_size,self.accumulation
                 for attempt in range(2):
                     command=[sys.executable,'-u','-m','src.train.train_dinr_beat','--output-dir',str(directory),
-                             '--train-sidecar',str(DATA/'dinr_beat_train_b512_o50.pt'),
-                             '--valid-sidecar',str(DATA/'dinr_beat_valid_b512_o50.pt'),
+                             '--train-sidecar',str(self.data_dir/f'dinr_beat_train_{self.sidecar_tag}.pt'),
+                             '--valid-sidecar',str(self.data_dir/f'dinr_beat_valid_{self.sidecar_tag}.pt'),
                              '--epochs','16','--learning-rate','3e-4','--batch-size',str(batch),
                              '--gradient-accumulation-steps',str(accumulation),'--seed',str(job['seed']),
                              '--early-stopping-patience','4','--duration-target',s['duration_target'],
@@ -139,12 +147,18 @@ class Supervisor:
                              '--duration-input-tables',s['duration_input_tables'],
                              '--duration-output-head',s['duration_output_head'],
                              '--measure-start' if s['measure_start'] else '--no-measure-start']
+                    if self.fixed_event_length:
+                        command.extend(['--fixed-event-length',str(self.fixed_event_length)])
+                    if self.normalize_partial:
+                        command.append('--normalize-partial-accumulation')
+                    if not self.beat_type_embedding:
+                        command.append('--no-beat-type-embedding')
                     try:
                         command_run(command,'training','train.log',attempt)
                         break
                     except RuntimeError:
                         log=(directory/'train.log').read_text(errors='replace')
-                        if attempt==0 and ('out of memory' in log.lower()):
+                        if self.experiment == 'exp1115' and attempt==0 and ('out of memory' in log.lower()):
                             batch,accumulation=4,8
                             job['oom_retry']='batch 4 x accumulation 8; effective batch remains 32'
                             continue
@@ -161,7 +175,7 @@ class Supervisor:
                 if ready.exists():
                     continue
                 command=[sys.executable,'-u','-m','src.evaluate.evaluate_dinr_beat',
-                         '--checkpoint',str(directory/'best'),'--sidecar',str(DATA/f'dinr_beat_{split}_b512_o50.pt'),
+                         '--checkpoint',str(directory/'best'),'--sidecar',str(self.data_dir/f'dinr_beat_{split}_{self.sidecar_tag}.pt'),
                          '--output-dir',str(output),'--split',split,'--samples','3']
                 for attempt in range(2):
                     try:

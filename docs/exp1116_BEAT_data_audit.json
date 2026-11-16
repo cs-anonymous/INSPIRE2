@@ -1,0 +1,70 @@
+{
+  "status": "passed",
+  "window_events": 512,
+  "stride_events": 512,
+  "window_policy": "fixed_event_count",
+  "overlap_ratio": 0.0,
+  "splits": {
+    "train": {
+      "path": "/home/kaititech/EPR/PianistTransformer/data/ASAP_processed_dinr_beat_e512_v1/dinr_beat_train_e512.pt",
+      "sha256": "03dcd558b3f035e9719d59ce21c2afd3ff78d00e9b937b82f5283b964881243c",
+      "source_sha256": "0a9aada3c8467a133a8d8357ede50641dd148043fb2ad3cbb584b5887f65c128",
+      "windows": 6561,
+      "events": 3154305,
+      "notes": 2739556,
+      "beats": 414749,
+      "works": 175,
+      "performances": 837,
+      "max_window_events": 512,
+      "padded_length": 512,
+      "padding_fraction": 0.06100412237082764,
+      "note_first_windows": 4964,
+      "note_only_windows": 3,
+      "beat_only_windows": 0
+    },
+    "valid": {
+      "path": "/home/kaititech/EPR/PianistTransformer/data/ASAP_processed_dinr_beat_e512_v1/dinr_beat_valid_e512.pt",
+      "sha256": "d06d2e47d01bc938d0053c54846dbe53b32ac07e86b38d529391cac6ab7736a5",
+      "source_sha256": "9085c58d2b10b4ac4a6c5b175f8cb75892f6a468d1f02c815d6fcf573c1bfcba",
+      "windows": 329,
+      "events": 159599,
+      "notes": 135467,
+      "beats": 24132,
+      "works": 12,
+      "performances": 47,
+      "max_window_events": 512,
+      "padded_length": 512,
+      "padding_fraction": 0.05253253229483279,
+      "note_first_windows": 262,
+      "note_only_windows": 0,
+      "beat_only_windows": 0
+    },
+    "test": {
+      "path": "/home/kaititech/EPR/PianistTransformer/data/ASAP_processed_dinr_beat_e512_v1/dinr_beat_test_e512.pt",
+      "sha256": "ccee5ed051b6c251886c864a5371cadaa826b3179149575f3cd7da74632dcafb",
+      "source_sha256": "31c0990a55813a2761278152a1c0af9c1bbb9afbef3640b2ce361f943edec58e",
+      "windows": 974,
+      "events": 480332,
+      "notes": 384954,
+      "beats": 95378,
+      "works": 19,
+      "performances": 82,
+      "max_window_events": 512,
+      "padded_length": 512,
+      "padding_fraction": 0.036808585728952736,
+      "note_first_windows": 734,
+      "note_only_windows": 0,
+      "beat_only_windows": 0
+    }
+  },
+  "checks": [
+    "frozen source hashes",
+    "identical continuous events and targets",
+    "every event covered exactly once",
+    "no cross-performance windows",
+    "arbitrary boundaries allowed including NOTE-first",
+    "512 total-event cap",
+    "work-disjoint splits",
+    "19 test works"
+  ]
+}

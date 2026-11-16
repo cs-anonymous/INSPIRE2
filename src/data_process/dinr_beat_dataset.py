@@ -8,6 +8,14 @@ import torch
 from torch.utils.data import Dataset
 
 
+def fixed_event_spans(event_count, block_events=512):
+    """Cut consecutive events without imposing BEAT/NOTE boundary rules."""
+    if block_events < 1:
+        raise ValueError('block_events must be positive')
+    return [(start, min(start + block_events, event_count))
+            for start in range(0, event_count, block_events)]
+
+
 class BeatTokenSpec:
     beat_type = 0
     note_type = 1
@@ -148,10 +156,18 @@ class DINRBeatDataset(Dataset):
 
 
 class DINRBeatCollator:
+    def __init__(self, fixed_length=None):
+        self.fixed_length = fixed_length
+
     def __call__(self, examples):
         batch_size = len(examples)
         max_len = max(example["encoder_tokens"].shape[0] for example in examples)
-        max_len = ((max_len + 7) // 8) * 8
+        if self.fixed_length is not None:
+            if max_len > self.fixed_length:
+                raise ValueError(f'Event window {max_len} exceeds fixed length {self.fixed_length}')
+            max_len = self.fixed_length
+        else:
+            max_len = ((max_len + 7) // 8) * 8
         encoder = torch.zeros((batch_size, max_len, 6), dtype=torch.long)
         decoder = torch.zeros_like(encoder)
         event_types = torch.full((batch_size, max_len), BeatTokenSpec.pad_type, dtype=torch.long)

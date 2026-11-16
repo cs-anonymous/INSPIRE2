@@ -20,7 +20,8 @@ class DINRBeatModel(nn.Module):
 
     def __init__(self, config=None, duration_target="absolute_log",
                  duration_input_tables="shared", duration_output_head="separate",
-                 decoder_mask_probability=0.5):
+                 decoder_mask_probability=0.5, use_beat_type_embedding=True,
+                 measure_start_vocab_size=2):
         super().__init__()
         self.config = config or PianoT5GemmaConfig()
         if duration_target not in {"absolute_log", "log_dev"}:
@@ -35,10 +36,18 @@ class DINRBeatModel(nn.Module):
         self.duration_input_tables = duration_input_tables
         self.duration_output_head = duration_output_head
         self.decoder_mask_probability = float(decoder_mask_probability)
+        self.use_beat_type_embedding = bool(use_beat_type_embedding)
+        if measure_start_vocab_size not in (1, 2):
+            raise ValueError('measure_start_vocab_size must be 1 or 2')
+        self.measure_start_vocab_size = measure_start_vocab_size
         self.backbone = PianoT5GemmaModel(self.config)
         self.backbone.encoder = DINRNoteEncoder(self.config.encoder)
         hidden = self.config.hidden_size
-        self.event_type_embedding = nn.Embedding(4, hidden, padding_idx=BeatTokenSpec.pad_type)
+        # exp1116 has no independent BEAT row: the remaining role rows are
+        # NOTE, BOS and PAD. BEAT identity is carried by measure_start alone.
+        self.event_type_embedding = nn.Embedding(
+            4 if self.use_beat_type_embedding else 3, hidden,
+            padding_idx=BeatTokenSpec.pad_type if self.use_beat_type_embedding else 2)
         self.pitch_embedding = nn.Embedding(BeatTokenSpec.pitch_bins, hidden)
         if duration_input_tables == "shared":
             self.duration_embedding = nn.Embedding(BeatTokenSpec.duration_bins, hidden)
@@ -50,7 +59,12 @@ class DINRBeatModel(nn.Module):
             self.note_duration_embedding = nn.Embedding(BeatTokenSpec.duration_bins, hidden)
         self.onset_embedding = nn.Embedding(BeatTokenSpec.onset_bins, hidden)
         self.velocity_embedding = nn.Embedding(BeatTokenSpec.velocity_bins, hidden)
-        self.measure_start_embedding = nn.Embedding(2, hidden)
+        if self.use_beat_type_embedding:
+            self.measure_start_embedding = nn.Embedding(measure_start_vocab_size, hidden)
+        else:
+            # One BEAT vocabulary: two tokens with measure_start enabled,
+            # otherwise a single token. No extra BEAT type vector is added.
+            self.beat_embedding = nn.Embedding(measure_start_vocab_size, hidden)
         decoder_hidden = self.config.decoder.hidden_size
         self.beat_duration_head = nn.Linear(decoder_hidden, BeatTokenSpec.duration_bins)
         self.note_duration_head = (
@@ -92,12 +106,17 @@ class DINRBeatModel(nn.Module):
         is_beat = event_type == BeatTokenSpec.beat_type
         is_note = event_type == BeatTokenSpec.note_type
         valid = is_beat | is_note | (event_type == BeatTokenSpec.bos_type)
-        result = self.event_type_embedding(event_type.clamp(0, BeatTokenSpec.pad_type))
+        if self.use_beat_type_embedding:
+            result = self.event_type_embedding(event_type.clamp(0, BeatTokenSpec.pad_type))
+        else:
+            result = self.event_type_embedding((event_type - 1).clamp(0, 2))
+            result = torch.where(is_beat.unsqueeze(-1), torch.zeros_like(result), result)
         result = result + self._duration_features(event_type, duration)
         note_features = (self.pitch_embedding(pitch.clamp(0, BeatTokenSpec.pitch_bins - 1))
                          + self.onset_embedding(onset.clamp(0, BeatTokenSpec.onset_bins - 1))
                          + self.velocity_embedding(velocity.clamp(0, BeatTokenSpec.velocity_bins - 1)))
-        beat_features = self.measure_start_embedding(measure.clamp(0, 1))
+        beat_table = self.measure_start_embedding if self.use_beat_type_embedding else self.beat_embedding
+        beat_features = beat_table(measure.clamp(0, self.measure_start_vocab_size - 1))
         result = result + torch.where(is_note.unsqueeze(-1), note_features,
                                       torch.where(is_beat.unsqueeze(-1), beat_features,
                                                   torch.zeros_like(note_features)))
@@ -194,6 +213,9 @@ class DINRBeatModel(nn.Module):
             "duration_input_tables": self.duration_input_tables,
             "duration_output_head": self.duration_output_head,
             "decoder_mask_probability": self.decoder_mask_probability,
+            "use_beat_type_embedding": self.use_beat_type_embedding,
+            "measure_start_vocab_size": self.measure_start_vocab_size,
+            "beat_embedding_tokens": self.measure_start_vocab_size,
             "duration_bins": BeatTokenSpec.duration_bins,
             "duration_absolute_log_range": BeatTokenSpec.duration_abs_range,
             "duration_log_dev_range": BeatTokenSpec.duration_dev_range,

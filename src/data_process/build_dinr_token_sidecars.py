@@ -129,13 +129,15 @@ def build(root: Path, output: Path, split: str, block_notes: int, overlap_ratio:
     if not score_parts:
         raise ValueError(f"No performances found for split={split}")
     result = {
-        "format": "dinr_absolute_tokens_v1",
+        "format": "dinr_absolute_tokens_v2",
         "split": window_split if split == "train" else split,
         "source_split": split,
         "window_split": window_split,
         "block_notes": int(block_notes),
         "overlap_ratio": float(overlap_ratio),
         "vocab_size": DINRTokenSpec.vocab_size,
+        "timing_bins": DINRTokenSpec.timing_bins,
+        "timing_bin_ms": DINRTokenSpec.timing_bin_ms,
         "source_name": ASAP_SIDECAR_NAME,
         "performances": performance_count,
         "windowed_performances": windowed_performance_count,
@@ -170,7 +172,10 @@ def main():
                         help="Fixed work-level validation split; all windows from these works are held out.")
     parser.add_argument("--block-notes", type=int, default=512)
     parser.add_argument("--overlap-ratio", type=float, default=0.5)
+    parser.add_argument("--timing-bins", type=int, default=500)
+    parser.add_argument("--timing-bin-ms", type=int, default=10)
     args = parser.parse_args()
+    DINRTokenSpec.configure_timing(args.timing_bins, args.timing_bin_ms)
     valid_windows = load_valid_works(args.fixed_window_summary) if args.fixed_window_summary else {}
     heldout_works = (
         load_heldout_work_manifest(args.valid_work_manifest)

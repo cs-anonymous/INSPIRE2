@@ -49,6 +49,18 @@ def load_state_dict(path):
 
 
 def make_model(args, checkpoint):
+    checkpoint = Path(checkpoint)
+    candidates = [
+        checkpoint / "dinr_config.json" if checkpoint.is_dir() else checkpoint.parent / "dinr_config.json",
+        checkpoint.parent / "dinr_config.json",
+        checkpoint.parent.parent / "dinr_config.json",
+    ]
+    config_path = next((path for path in candidates if path.exists()), candidates[0])
+    saved_config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    DINRTokenSpec.configure_timing(
+        getattr(args, "timing_bins", None) or saved_config.get("timing_bins", DINRTokenSpec.timing_bins),
+        getattr(args, "timing_bin_ms", None) or saved_config.get("timing_bin_ms", DINRTokenSpec.timing_bin_ms),
+    )
     state = load_state_dict(checkpoint)
     if "state_dict" in state and isinstance(state["state_dict"], dict):
         state = state["state_dict"]
@@ -101,7 +113,8 @@ def make_model(args, checkpoint):
         separate_coordinate_projections=separate_coordinates,
         num_input_slots=num_input_slots,
         separate_ioi_duration_tables=separate_ioi_duration_tables,
-        decoder_mask_mode="timestep",
+        decoder_mask_mode=saved_config.get("decoder_mask_mode", "timestep"),
+        decoder_input_pitch=saved_config.get("decoder_input_pitch", True),
         timing_target_mode=args.timing_target_mode or "absolute",
         time_input_mode=args.time_input_mode or "linear",
     )
@@ -154,9 +167,9 @@ def predict_notes(model, score_tokens, score_raw, score_zero_mask, device, inclu
         )
         past_key_values = None
         for index in range(n):
-            current = ([DINRTokenSpec.bos_id] * model.num_input_slots) if index == 0 else decoder_history[-1]
+            current = ([DINRTokenSpec.bos_id] * model.decoder_num_input_slots) if index == 0 else decoder_history[-1]
             decoder = torch.tensor(current, dtype=torch.long, device=device).view(
-                1, 1, model.num_input_slots
+                1, 1, model.decoder_num_input_slots
             )
             decoder_mask = torch.ones((1, index + 1), dtype=torch.long, device=device)
             output = model(
@@ -202,13 +215,62 @@ def predict_notes(model, score_tokens, score_raw, score_zero_mask, device, inclu
             feedback = list(token)
             if model.timing_target_mode == "score_relative_log":
                 if score_zero_mask[index]:
-                    grouped_ms = np.exp(ioi_class / 499.0 * 5.0)
+                    grouped_ms = np.exp(ioi_class / (DINRTokenSpec.timing_bins - 1) * 5.0)
                 else:
-                    grouped_ms = max(float(score_raw[index, 0]), 1.0) * np.exp(-3.0 + ioi_class / 499.0 * 5.0)
-                duration_ms = max(float(score_raw[index, 1]), 1.0) * np.exp(-3.0 + duration_class / 499.0 * 5.0)
+                    grouped_ms = max(float(score_raw[index, 0]), 1.0) * np.exp(-3.0 + ioi_class / (DINRTokenSpec.timing_bins - 1) * 5.0)
+                duration_ms = max(float(score_raw[index, 1]), 1.0) * np.exp(-3.0 + duration_class / (DINRTokenSpec.timing_bins - 1) * 5.0)
                 feedback[1] = DINRTokenSpec.timing_start + DINRTokenSpec.log_time_bin(grouped_ms)
                 feedback[3] = DINRTokenSpec.timing_start + DINRTokenSpec.log_time_bin(duration_ms)
-            decoder_history.append(feedback)
+            decoder_history.append(feedback if model.decoder_input_pitch else feedback[1:4])
+    return generated
+
+
+def sample_top_p_batch(logits, temperature, top_p):
+    """Sample independent categorical rows without autoregressive feedback."""
+    if temperature <= 0 or not 0 < top_p <= 1:
+        raise ValueError("temperature must be positive and top_p in (0, 1]")
+    values, indices = torch.sort(logits.float() / temperature, dim=-1, descending=True)
+    probabilities = values.softmax(dim=-1)
+    remove = probabilities.cumsum(dim=-1) - probabilities > top_p
+    selected = torch.multinomial(values.masked_fill(remove, float("-inf")).softmax(dim=-1), 1)
+    return indices.gather(-1, selected).squeeze(-1)
+
+
+def predict_teacher_forced_notes(model, score_tokens, target_tokens, score_zero_mask, device,
+                                 temperature=1.0, top_p=0.9, seed=42, chunk_size=128):
+    """Predict current numeric fields from strictly shifted human history.
+
+    The decoder cache contains only true preceding notes. Chunks keep the full
+    causal history while bounding the memory used by the 5000-class logits.
+    """
+    if model.pedal_mode != "none" or model.num_input_slots != 4 or model.timing_target_mode != "absolute" or model.time_input_mode != "linear":
+        raise ValueError("TF diagnostic currently requires four-field, absolute/linear, no-pedal inputs")
+    if len(score_tokens) != len(target_tokens) or not len(score_tokens) or chunk_size < 1:
+        raise ValueError("TF requires aligned nonempty score/target sequences and positive chunk size")
+    torch.manual_seed(int(seed))
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(int(seed))
+    score = torch.tensor(score_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    history = torch.tensor([[DINRTokenSpec.bos_id] * 4] + target_tokens[:-1], dtype=torch.long, device=device).unsqueeze(0)
+    score_mask = torch.ones(score.shape[:2], dtype=torch.long, device=device)
+    generated, past = [], None
+    with torch.no_grad():
+        encoder = model.backbone.encoder(inputs_embeds=model._sum_note_tokens(score), attention_mask=score_mask)
+        for start in range(0, score.shape[1], chunk_size):
+            end = min(start + chunk_size, score.shape[1])
+            output = model(score_tokens=score, decoder_tokens=history[:, start:end],
+                           attention_mask=score_mask, decoder_attention_mask=score_mask[:, :end],
+                           encoder_outputs=encoder, past_key_values=past, use_cache=True,
+                           cache_position=torch.arange(start, end, device=device))
+            past = output["past_key_values"]
+            logits = output["logits"]
+            chord = torch.tensor(score_zero_mask[start:end], dtype=torch.bool, device=device).unsqueeze(-1)
+            ioi = sample_top_p_batch(torch.where(chord, logits["chord_ioi"][0], logits["grouped_ioi"][0]), temperature, top_p)
+            duration = sample_top_p_batch(logits["duration"][0], temperature, top_p)
+            velocity = sample_top_p_batch(logits["velocity"][0], temperature, top_p)
+            generated.extend(torch.stack((score[0, start:end, 0], ioi + DINRTokenSpec.timing_start,
+                                          velocity + DINRTokenSpec.velocity_start,
+                                          duration + DINRTokenSpec.timing_start), dim=-1).cpu().tolist())
     return generated
 
 
@@ -246,11 +308,11 @@ def tokens_to_raw(score_raw, score_tokens, pred_tokens, score_zero_mask, pedal_m
         decoded_ioi = np.zeros(len(ioi_class), dtype=np.float64)
         for index, category in enumerate(ioi_class):
             if score_zero_mask[index]:
-                decoded_ioi[index] = np.exp(category / 499.0 * 5.0)
+                decoded_ioi[index] = np.exp(category / (DINRTokenSpec.timing_bins - 1) * 5.0)
             else:
-                decoded_ioi[index] = max(score_ioi[index], 1.0) * np.exp(-3.0 + category / 499.0 * 5.0)
+                decoded_ioi[index] = max(score_ioi[index], 1.0) * np.exp(-3.0 + category / (DINRTokenSpec.timing_bins - 1) * 5.0)
         grouped = decoded_ioi
-        duration = np.maximum(score_duration, 1.0) * np.exp(-3.0 + duration_class / 499.0 * 5.0)
+        duration = np.maximum(score_duration, 1.0) * np.exp(-3.0 + duration_class / (DINRTokenSpec.timing_bins - 1) * 5.0)
     velocity = pred_tokens[:, 2] - DINRTokenSpec.velocity_start
     ioi = expand_grouped_ioi(score_raw, grouped, score_zero_mask)
     if pedal_mode == "none":
@@ -321,14 +383,21 @@ def parse_args():
     parser.add_argument("--attention-heads", type=int, default=8)
     parser.add_argument("--key-value-heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--timing-bins", type=int, default=None)
+    parser.add_argument("--timing-bin-ms", type=int, default=None)
     parser.add_argument("--limit-works", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--num-samples", type=int, default=3)
+    parser.add_argument("--sample-start-index", type=int, default=0,
+                        help="First sample index; use 2 with --num-samples 1 to append the third draw.")
     parser.add_argument("--timing-target-mode", choices=["absolute", "log_absolute", "score_relative_log"], default=None)
     parser.add_argument("--time-input-mode", choices=["linear", "log_absolute"], default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--teacher-forcing", action="store_true",
+                        help="Evaluate each true test performance as decoder history; average within work.")
+    parser.add_argument("--tf-chunk-size", type=int, default=128)
     return parser.parse_args()
 
 
@@ -430,6 +499,9 @@ def worker_loop(worker_index, args, job_queue, result_queue):
             spec, sample_index = job
             try:
                 sample_seed = stable_seed(args.seed, spec["work"], sample_index)
+                if args.teacher_forcing:
+                    result_queue.put(teacher_forced_work(model, spec, sample_index, sample_seed, args, device))
+                    continue
                 prediction_tokens = predict_notes(
                     model, spec["score_tokens"], np.asarray(spec["score_raw"], dtype=np.float64),
                     spec["score_zero_mask"], device,
@@ -457,13 +529,46 @@ def worker_loop(worker_index, args, job_queue, result_queue):
         result_queue.put({"worker": worker_index, "error": traceback.format_exc(), "fatal": True})
 
 
+def teacher_forced_work(model, spec, sample_index, sample_seed, args, device):
+    payload = torch.load(spec["sidecar"], map_location="cpu", weights_only=False)
+    performances = [p for p in payload["performances"] if p.get("split") == "test"]
+    references = [midi_note_arrays(path) for path in spec["gt_paths"]]
+    rows = []
+    for history_index, performance in enumerate(performances):
+        _, targets, _ = _performance_tokens(payload["score"], performance, include_pedal=False)
+        seed = stable_seed(sample_seed, history_index, 0)
+        predicted = predict_teacher_forced_notes(model, spec["score_tokens"], targets,
+                                                 spec["score_zero_mask"], device, args.temperature,
+                                                 args.top_p, seed, args.tf_chunk_size)
+        raw = tokens_to_raw(np.asarray(spec["score_raw"]), spec["score_tokens"], predicted,
+                            spec["score_zero_mask"], "none", "absolute")
+        path = args.output_dir / f"score_{spec['work']:02d}" / f"sample_{sample_index:03d}" / f"history_{history_index:03d}.mid"
+        raw_to_midi(spec["score_pitch"], raw, path)
+        pred = midi_note_arrays(path)
+        usable = min([len(pred)] + [len(ref) for ref in references])
+        if usable < 1:
+            raise ValueError("Empty teacher-forced prediction/reference")
+        values = np.abs(pred[None, :usable, :3] - np.stack([ref[:usable, :3] for ref in references])).mean(axis=(0, 1))
+        metrics = dict(zip(("ioi_wass", "duration_wass", "velocity_wass"), map(float, values)))
+        metrics["pn_wass_mean"] = float(np.mean(values))
+        rows.append(dict(history=history_index, seed=seed, prediction=str(path), pn_wass=metrics,
+                         usable_notes=usable))
+    if not rows:
+        raise ValueError("No test histories")
+    metrics = {key: float(np.mean([row["pn_wass"][key] for row in rows])) for key in rows[0]["pn_wass"]}
+    return dict(work=spec["work"], sample=int(sample_index), seed=sample_seed, conditioning="teacher_forced",
+                history_count=len(rows), histories=rows, ground_truth_count=len(references),
+                pn_wass=metrics, error=None)
+
+
 def run_pool(args, specs):
     if args.num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
     ctx = mp.get_context("spawn")
     job_queue = ctx.Queue()
     result_queue = ctx.Queue()
-    jobs = [(spec, sample) for spec in specs for sample in range(args.num_samples)]
+    jobs = [(spec, sample) for spec in specs
+            for sample in range(args.sample_start_index, args.sample_start_index + args.num_samples)]
     workers = [ctx.Process(target=worker_loop, args=(i, args, job_queue, result_queue))
                for i in range(args.num_workers)]
     for worker in workers:
@@ -493,6 +598,8 @@ def main():
     args = parse_args()
     if args.num_samples < 1:
         raise ValueError("--num-samples must be >= 1")
+    if args.sample_start_index < 0:
+        raise ValueError("--sample-start-index must be >= 0")
     include_pedal = args.pedal_mode != "none"
     checkpoint_path = Path(args.checkpoint).resolve()
     config_paths = [checkpoint_path / "dinr_config.json"]
@@ -515,11 +622,15 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_records = []
     for spec in specs:
-        for sample_index in range(args.num_samples):
+        for sample_index in range(args.sample_start_index, args.sample_start_index + args.num_samples):
             run_records.append({
                 "gpu_visible_device": args.device,
                 "checkpoint": str(args.checkpoint.resolve()),
-                "training_seed": 42,
+                "training_seed": config.get("model_seed", 42),
+                "data_seed": config.get("data_seed", config.get("model_seed", 42)),
+                "decoder_input_pitch": config.get("decoder_input_pitch", True),
+                "decoder_input_slots": config.get("decoder_num_input_slots", num_input_slots),
+                "conditioning": "teacher_forced" if args.teacher_forcing else "autoregressive",
                 "sampling_seed": stable_seed(args.seed, spec["work"], sample_index),
                 "temperature": args.temperature,
                 "top_p": args.top_p,
@@ -540,9 +651,14 @@ def main():
     result = {
         "pedal_mode": args.pedal_mode, "works": len(specs), "num_samples": args.num_samples,
         "num_predictions": len(rows), "num_workers": args.num_workers,
+        "sample_start_index": args.sample_start_index,
         "temperature": args.temperature, "top_p": args.top_p, "seed": args.seed,
+        "conditioning": "teacher_forced" if args.teacher_forcing else "autoregressive",
         "pn_wass": aggregate, "rows": rows,
     }
+    if args.teacher_forcing:
+        result["num_history_predictions"] = sum(row["history_count"] for row in rows)
+        result["aggregation"] = "average all human decoder histories within work, then equal-weight works"
     completed = {(row["work"], row["sample"]): row for row in rows}
     for record in run_records:
         row = completed.get((record["score_index"], record["sample_index"]))

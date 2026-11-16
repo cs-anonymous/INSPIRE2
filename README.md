@@ -14,6 +14,54 @@ This is the official implementation for the paper **"Pianist Transformer: Toward
 
 Our work demonstrates that by pre-training on billions of tokens of unlabeled MIDI data, a model can learn a profound understanding of musical structures. This knowledge can then be transferred to the downstream task of expressive performance generation, producing piano performances that are statistically indistinguishable from those of human pianists in subjective listening tests.
 
+## exp1112 DINR training and validation curves
+
+The 18 DINR experiments start from random initialization. Columns compare
+separate abs5000 lookup, shared abs5000 lookup, log timing targets, and pure
+coordinate replacement. Train loss is on the top row and half-epoch validation
+loss is on the bottom row; stars mark the best validation points. Each column
+uses its observed maximum epoch for both rows.
+
+![exp1112 grouped train and validation loss](analysis/exp1112/dinr_groups.png)
+
+[Experiment settings and results](docs/exp1112_DINR_VAR.md) ·
+[Figure PDF](analysis/exp1112/dinr_groups.pdf)
+
+The best checkpoints (18 DINR and two PT references) are evaluated with three
+samples per test work. HR tables report mean ± sample standard deviation over
+three sampling rounds, each averaged over the same 19 works (n=3).
+[Per-round metrics](analysis/exp1112/sampling3_rounds.csv) ·
+[Mean/std summary](analysis/exp1112/sampling3_summary.csv)
+
+Six follow-ups add four `timestep E4D3` representations (lookup, MLP32, MLP64,
+linear) and two MLP32/64 batch-order controls. E4D3 retains four encoder fields
+and feeds only IOI, velocity, and duration to the decoder. Batch-order controls
+keep model seed 42 and use data seed 43. Each new best checkpoint receives three
+sampling rounds; the figure below updates as training proceeds.
+
+![E4D3 and batch-order train/valid curves](analysis/exp1112/e4d3_batch_groups.png)
+
+The `timestep 1+pitch / pure coordinate MLP64` epoch diagnostic retains validation
+checkpoints with the same patience-4 stopping rule. Each epoch compares mean
+online train loss, validation loss, teacher-forced test HR, and autoregressive
+test HR. The figures update as checkpoint evaluations complete.
+
+![MLP64 epoch loss and TF/AR HR](analysis/exp1112/epoch_diagnostic/epoch_metrics.png)
+
+The same saved MIDI from all eight epochs is also scored with rebuttal KL/JS
+and beat-level Pearson metrics. Three-round error bars show sampling variation;
+these metrics do not consistently improve with validation CE. A control keeps
+the original HR reference MIDI to check the effect of reference normalization.
+
+![MLP64 epoch rebuttal metrics](analysis/exp1112/epoch_diagnostic/rebuttal_metrics/epoch_metrics.png)
+
+JS is also computed directly from the archived MIDI at the output vocabulary's
+granularity: 5000 one-millisecond timing bins and 128 velocity bins. This measures
+the final adjacent-note IOI; recovering the model's grouped IOI tokens is a
+separate replay because export subtracts within-group gaps and clips at zero.
+
+![Final MIDI JS at token granularity](analysis/exp1112/epoch_diagnostic/midi_token_granularity_js/token_js.png)
+
 ## Beat / Note timing experiments (exp1115)
 
 The beat-aware DINR design uses typed BEAT/NOTE events, 500-token log duration
