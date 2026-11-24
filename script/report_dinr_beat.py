@@ -67,6 +67,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--campaign',type=Path,default=ROOT.parent/'results/exp1115_beat')
     parser.add_argument('--experiment',choices=['exp1115','exp1116'],default='exp1115')
+    parser.add_argument('--doc-path',type=Path,default=None)
     args=parser.parse_args()
     new_protocol=args.experiment=='exp1116'
     manifest=json.loads((args.campaign/'manifest.json').read_text())
@@ -162,7 +163,7 @@ def main():
 
     lines=['# exp1115：Beat / Note 双级时间表示实验','',
            '## 1. 协议与进度','',
-           '[设计文档](design1115_beat.md)；[冻结数据审计](design1115_beat_data_audit.json)。A0 已有结果，不重跑。',
+           '[设计文档](design1115_beat.md)；[冻结数据审计](../analysis/design1115_beat_data_audit.json)。A0 已有结果，不重跑。',
            '',f"更新时间：{manifest.get('updated_at')}。完整计划为 12 项设置 × 3 个训练种子 = 36 次训练；当前已建立 {len(manifest['jobs'])} 个任务，完成训练及 TF/AR 评估 {completed} 个。后续配置按验证集依赖分阶段加入。",'',
            '每次从随机权重开始；最大 16 epoch，每半 epoch 验证一次，patience=4（连续四次验证未改善停止），仅保留最低 valid CE 的 checkpoint。AdamW，起始学习率 3e-4，线性衰减，有效 batch=32（8×4）。decoder 训练时以 0.5 概率遮住整个历史 BEAT/NOTE 事件向量，BOS 不遮；padding 不参与有效预测和 loss，验证和生成关闭遮蔽。',
            '',
@@ -225,9 +226,9 @@ def main():
         replacement=[]
         for line in lines:
             if line.startswith('# exp1115'):
-                line='# exp1116：512 总事件定长 Beat / Note 实验'
+                line='# exp1115：512 总事件定长 Beat / Note 实验'
             elif line.startswith('[设计文档]'):
-                line='沿用 [1115 设计](design1115_beat.md) 的数值表示；本轮修改以本文为准。[固定切分数据审计](exp1116_BEAT_data_audit.json)。1115 队列保持暂停。'
+                line='遵循 [1115 设计](design1115_beat.md)；固定 512 总事件切分、beat embedding 和实验设置以该设计文档为准。[固定切分数据审计](../analysis/exp1115_beat/fixed_event_data_audit.json)。'
             elif line.startswith('更新时间：'):
                 line=f"更新时间：{manifest.get('updated_at')}。完整计划为 A/B/D 共 10 项设置、每项一次训练；当前已建立 {len(manifest['jobs'])} 个任务，训练及 TF/AR 评估完成 {completed} 个。队列状态：`{manifest['status']}`。C 组不运行。"
             elif line.startswith('每次从随机权重开始'):
@@ -250,7 +251,9 @@ def main():
                 line='全部 10 次训练及其三轮 TF/AR 评估已完成。'
             replacement.append(line)
         lines=replacement
-    doc=ROOT/f'docs/{args.experiment}_BEAT.md'
+    doc=args.doc_path if args.doc_path is not None else ROOT/f'docs/{args.experiment}_BEAT.md'
+    if not doc.is_absolute():
+        doc=ROOT/doc
     analysis = ''
     if doc.exists():
         previous = doc.read_text()

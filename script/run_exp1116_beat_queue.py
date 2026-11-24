@@ -62,7 +62,7 @@ def main():
     args.run_dir.mkdir(parents=True,exist_ok=True)
     with (args.run_dir/'supervisor.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        audit=json.loads((ROOT/'docs/exp1116_BEAT_data_audit.json').read_text())
+        audit=json.loads((ROOT/'analysis/exp1115_beat/fixed_event_data_audit.json').read_text())
         assert audit['status']=='passed' and audit['splits']['test']['works']==19
         for split,row in audit['splits'].items():
             assert hashlib.sha256(Path(row['path']).read_bytes()).hexdigest()==row['sha256'], split

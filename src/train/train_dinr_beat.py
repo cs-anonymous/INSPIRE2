@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -52,6 +53,7 @@ def main():
     parser.add_argument("--duration-output-head", choices=["separate", "shared_conditioned", "shared"], default="separate")
     parser.add_argument("--measure-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--decoder-mask-probability", type=float, default=0.5)
+    parser.add_argument("--onset-target", choices=["abs", "ratio", "dev"], default="ratio")
     parser.add_argument("--epochs", type=float, default=16)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
@@ -63,6 +65,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-seed", type=int, default=None)
     parser.add_argument("--early-stopping-patience", type=int, default=4)
+    parser.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--encoder-layers", type=int, default=10)
@@ -81,10 +84,10 @@ def main():
     note_target = args.note_duration_target or args.duration_target
     train = DINRBeatDataset(args.train_sidecar, args.duration_target,
                             args.duration_input_tables, args.measure_start, args.limit_train,
-                            beat_target, note_target)
+                            beat_target, note_target, onset_target=args.onset_target)
     valid = DINRBeatDataset(args.valid_sidecar, args.duration_target,
                             args.duration_input_tables, args.measure_start, args.limit_valid,
-                            beat_target, note_target)
+                            beat_target, note_target, onset_target=args.onset_target)
     config = PianoT5GemmaConfig(
         encoder_layers_num=args.encoder_layers,
         decoder_layers_num=args.decoder_layers,
@@ -99,7 +102,8 @@ def main():
                           args.duration_input_tables, args.duration_output_head,
                           args.decoder_mask_probability,
                           use_beat_type_embedding=args.beat_type_embedding,
-                          measure_start_vocab_size=2 if args.measure_start or args.beat_type_embedding else 1)
+                          measure_start_vocab_size=2 if args.measure_start or args.beat_type_embedding else 1,
+                          onset_target=args.onset_target)
     model.beat_duration_target = beat_target
     model.note_duration_target = note_target
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -109,18 +113,24 @@ def main():
         "train_windows": len(train),
         "valid_windows": len(valid),
         "duration_bins": 500,
+        "duration_bin_width": 0.01,
         "beat_duration_target": beat_target,
         "note_duration_target": note_target,
         "duration_abs_log_range": [3.0, 8.0],
-        "duration_log_dev_range": [-2.0, 3.0],
-        "onset_bins": 500,
-        "onset_range": [-0.25, 1.0],
+        "duration_log_dev_range": [-3.0, 2.0],
+        "onset_input_bins": 500,
+        "onset_input_range": [-0.25, 1.0],
+        "onset_bins": (200 if args.onset_target == "dev" else 500),
+        "onset_range": ([-1.0, 1.0] if args.onset_target == "dev" else [-0.25, 1.0]),
+        "onset_target": args.onset_target,
+        "sidecar_format": train.data['format'],
         "initialization": "random",
         "window_events": train.data.get("window_events"),
         "window_policy": train.data.get("window_policy", "whole_beat_note_cap"),
         "measure_start_vocab_size": model.measure_start_vocab_size,
     })
-    (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, default=str) + "\n")
+    if int(__import__('os').environ.get('RANK', '0')) == 0:
+        (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, default=str) + "\n")
     training_args = TrainingArguments(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
@@ -136,7 +146,7 @@ def main():
         save_strategy="epoch",
         save_total_limit=1,
         save_only_model=True,
-        load_best_model_at_end=True,
+        load_best_model_at_end=args.load_best_model_at_end,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         logging_strategy="steps",
@@ -160,19 +170,31 @@ def main():
     )
     trainer.normalize_partial_accumulation = args.normalize_partial_accumulation
     trainer.train()
-    trainer.save_model(str(args.output_dir / "best"))
-    trainer.state.save_to_json(str(args.output_dir / "trainer_state.json"))
-    (args.output_dir / "trainer_log_history.json").write_text(
-        json.dumps(trainer.state.log_history, indent=2) + "\n", encoding="utf-8"
-    )
-    result = {
-        "best_checkpoint": trainer.state.best_model_checkpoint,
-        "best_valid_loss": trainer.state.best_metric,
-        "global_step": trainer.state.global_step,
-        "stopped_epoch": trainer.state.epoch,
-    }
-    (args.output_dir / "training_summary.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2), flush=True)
+    if not args.load_best_model_at_end and trainer.is_world_process_zero():
+        best_checkpoint = trainer.state.best_model_checkpoint
+        if best_checkpoint:
+            state_path = Path(best_checkpoint) / "pytorch_model.bin"
+            state = torch.load(state_path, map_location="cpu", weights_only=True)
+            trainer.model.load_state_dict(state)
+    # Explicitly guard the final export. In multi-GPU Trainer runs, calling
+    # the custom save hook from every rank can make all ranks write the same
+    # 474 MB checkpoint concurrently and deadlock during teardown.
+    if trainer.is_world_process_zero():
+        trainer.save_model(str(args.output_dir / "best"))
+    trainer.accelerator.wait_for_everyone()
+    if trainer.is_world_process_zero():
+        trainer.state.save_to_json(str(args.output_dir / "trainer_state.json"))
+        (args.output_dir / "trainer_log_history.json").write_text(
+            json.dumps(trainer.state.log_history, indent=2) + "\n", encoding="utf-8"
+        )
+        result = {
+            "best_checkpoint": trainer.state.best_model_checkpoint,
+            "best_valid_loss": trainer.state.best_metric,
+            "global_step": trainer.state.global_step,
+            "stopped_epoch": trainer.state.epoch,
+        }
+        (args.output_dir / "training_summary.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result, indent=2), flush=True)
 
 
 if __name__ == "__main__":

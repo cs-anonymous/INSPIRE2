@@ -18,15 +18,16 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def prepare(source, output, block_events=512):
-    frozen = json.loads((ROOT/'docs/design1115_beat_data_audit.json').read_text())
+def prepare(source, output, block_events=512, frozen_path=None,
+            source_tag='b512_o50', output_tag=None):
+    frozen = json.loads(frozen_path.read_text()) if frozen_path is not None else None
     audit = dict(status='passed',window_events=block_events,stride_events=block_events,
                  window_policy='fixed_event_count',overlap_ratio=0.0,splits={})
     work_sets = {}
     output.mkdir(parents=True, exist_ok=True)
     for split in ('train','valid','test'):
-        path = source/f'dinr_beat_{split}_b512_o50.pt'
-        if sha256(path) != frozen['splits'][split]['sha256']:
+        path = source/f'dinr_beat_{split}_{source_tag}.pt'
+        if frozen is not None and sha256(path) != frozen['splits'][split]['sha256']:
             raise ValueError(f'{split}: frozen source hash differs')
         data = torch.load(path,map_location='cpu',weights_only=False)
         events, targets = data['events'], data['targets']
@@ -46,7 +47,7 @@ def prepare(source, output, block_events=512):
         data.update(samples=samples,window_notes=None,window_events=block_events,
                     stride_events=block_events,window_policy='fixed_event_count',overlap_ratio=0.0,
                     source_sidecar=str(path.resolve()),source_sha256=sha256(path))
-        destination=output/f'dinr_beat_{split}_e{block_events}.pt'
+        destination=output/f'dinr_beat_{split}_{output_tag or f"e{block_events}"}.pt'
         torch.save(data,destination)
         work_sets[split]={r['work'] for r in data['performances']}
         lengths=np.array([r['span'][1]-r['span'][0] for r in samples])
@@ -74,10 +75,15 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-dir',type=Path,default=ROOT.parent/'data/ASAP_processed_dinr_beat_v1')
     parser.add_argument('--output-dir',type=Path,default=ROOT.parent/'data/ASAP_processed_dinr_beat_e512_v1')
-    parser.add_argument('--audit',type=Path,default=ROOT/'docs/exp1116_BEAT_data_audit.json')
+    parser.add_argument('--source-audit',type=Path,default=None,
+                        help='Optional audit JSON containing frozen source hashes')
+    parser.add_argument('--source-tag',default='b512_o50')
+    parser.add_argument('--output-tag',default=None)
+    parser.add_argument('--audit',type=Path,default=ROOT/'analysis/exp1115_beat/fixed_event_data_audit.json')
     args=parser.parse_args()
     torch.set_num_threads(4)
-    result=prepare(args.source_dir,args.output_dir)
+    result=prepare(args.source_dir,args.output_dir,frozen_path=args.source_audit,
+                   source_tag=args.source_tag,output_tag=args.output_tag)
     args.audit.parent.mkdir(parents=True,exist_ok=True)
     args.audit.write_text(json.dumps(result,indent=2)+'\n')
 

@@ -31,38 +31,38 @@ $$
 
 其中 `B_b` 是模型还原出的 performance beat 起点。`u=0.10` 表示拍点后 10% performance beat duration，`u=-0.05` 表示早 5%，`u=1.10` 表示落在下一 beat 起点之后 10%，但音符仍按 score 对齐关系归属原 beat。`u` 是 note 相对 performance beat 的位置。
 
-## 3. 双级比例统计（ScorePerformer beat 映射的初步结果）
+## 3. 双级比例统计（onset-group 均值与线性插值）
 
 拍不是从演奏音符里挑一个“第一个音”。理论上的拍网格应由 score 的小节线、拍号和拍内分组确定：例如 4/4 通常以四分音符为拍，6/8 通常以附点四分音符为复合拍。即使该拍没有音符，beat token 仍存在；休止拍也不能删除，否则 score beat 的时间轴会断掉。
 
-初步分析覆盖 19 首 ASAP test 乐曲、384,954 个对齐的演奏音符。当前数据没有独立的演奏 beat 标注，因此拍网格直接由 score MIDI 的拍号生成，采用仓库已有的 ScorePerformer 流程：先将相同 score 起音的音符合并成一个 onset group，取该组所有已演奏音符的 performance 起音**均值**形成 `(score_onset, performance_onset)` pair；然后由 `get_performance_beats` 对 score beat 边界做 exact hit 或相邻 onset pair 之间的线性插值，并启用单调时间过滤。因此 beat 锚点不是同 musical onset 的第一颗低音，也不携带 pitch 排序；同一 onset 组只贡献一个聚合时间。
+本次统计覆盖 19 首 ASAP test 乐曲、384,954 个对齐演奏音符。拍网格由 score MIDI 的拍号确定；performance beat 不使用独立 beat 标注，而按以下确定性规则映射：先把 score onset 相同的音符合并成 onset group，取组内配对 performance onset 的算术均值作为该组时间；score beat 边界恰好命中 onset group 时取组均值，否则仅在相邻已观测 onset group 之间做线性插值。首末 onset group 以外不外推；不做 tempo 阈值过滤，也不做单调性过滤。只有两个 beat 边界都有观测范围支持，且映射后的 beat duration 为正时，该 beat interval 才纳入 beat/onset 统计。
 
-这个流程是已有的确定性 score-to-performance beat 映射，不训练 beat detector，也不额外拟合模型。需要注意，均值仍会把和弦内部的起音差异压成一个组时间，单调过滤也可能删除局部反向 pair；因此 note-level residual 仍混合演奏偏移、和弦内不同步及对齐噪声。下方比例应看作该标准流程下的诊断，不直接等同于演奏者提前/延后的真实发生率。
+该规则不按音高选择和弦锚点，也不要求组内音符按低到高排列。组均值会压缩和弦内部的滚奏差异；局部反向 onset group 不会被删掉，而会使跨越它的非正 beat interval 不可用。note-level dev 因而仍包含组内滚奏与对齐误差，但不会把 unsupported 的外推 beat 当成有效测量。
 
 ### 3.1 Beat duration
 
-这里的 `beat duration` 明确定义为**当前 beat anchor 到下一个 beat anchor 的时间间距**。性能侧使用相邻 `get_performance_beats` 输出的差，score 侧使用相邻 score beat ticks 按 score tempo 换算出的时长。它不是 note-to-note IOI。
+这里的 `beat duration` 明确定义为**当前 beat anchor 到下一个 beat anchor 的时间间距**。性能侧使用相邻新映射 beat anchors 的差，score 侧使用相邻 score beat ticks 按 score tempo 换算出的时长。它不是 note-to-note IOI。
 
 | 统计量 | 比例 |
 |---|---:|
-| Beat duration 样本数 | 95,378 |
-| 均值 / 中位数 | 1.105 / 1.019 |
-| 5 / 25 / 75 / 95 分位数 | 0.595 / 0.895 / 1.197 / 1.810 |
-| `[0, 1]` | 45.57% |
-| `>1` | 54.43% |
+| Beat duration 样本数 | 95,044 |
+| 均值 / 中位数 | 1.094 / 1.018 |
+| 5 / 25 / 75 / 95 分位数 | 0.594 / 0.895 / 1.195 / 1.799 |
+| `[0, 1]` | 45.64% |
+| `>1` | 54.36% |
 
 这里大于 1 代表实际拍间时长长于 score 标准拍时长，也就是该拍局部较慢；小于 1 则较快。`r` 严格来说不会小于等于零。统计中位数略高于 1，反映该批 test 性能的估计拍长总体略长于 score 时值。
 
-对训练目标而言，ratio 的对数更合适：`ln(r)=0` 是不偏离 score tempo，正值是放慢，负值是加快。当前 `ln(r)` 的中位数为 0.019，5/95 分位数为 -0.520/0.594。
+对训练目标而言，ratio 的对数更合适：`ln(r)=0` 是不偏离 score tempo，正值是放慢，负值是加快。当前 `ln(r)` 的均值/中位数为 `0.032/0.018`，5/95 分位数为 `-0.520/0.587`。
 
 下面比较 score 和 performance 的绝对 beat duration 以及其自然对数。两边按各自样本数归一化，log 图使用 `ln(duration in ms)`。
 
 | 统计量 | Score beat duration | Performance beat duration |
 |---|---:|---:|
-| 样本数 | 95,378 | 95,378 |
-| 均值 / 中位数（ms） | 338.740 / 267.857 | 375.719 / 260.330 |
-| 5 / 95 分位数（ms） | 150.000 / 789.474 | 129.753 / 953.428 |
-| 均值 / 中位数（ln ms） | 5.659 / 5.590 | 5.694 / 5.562 |
+| 样本数 | 95,044 | 95,044 |
+| 均值 / 中位数（ms） | 337.790 / 267.857 | 372.354 / 259.799 |
+| 5 / 95 分位数（ms） | 150.000 / 750.000 | 129.802 / 940.642 |
+| 均值 / 中位数（ln ms） | 5.658 / 5.590 | 5.690 / 5.560 |
 
 ![Beat duration ratio and log deviation](../analysis/design1115_beat_duration_ratio_logdev.png)
 
@@ -70,25 +70,49 @@ $$
 
 ### 3.2 Note-token onset / 实际局部拍长
 
+这里同时报告 score 与 performance 两侧的 note onset。Score onset 是音符相对所属 score beat 起点的固定比例：
+
+$$
+u_i^{\mathrm{score}}=\frac{s_i-S_{b_i}}{S_{b_i+1}-S_{b_i}},
+$$
+
+其中 $s_i$ 是 score note 起点，$S_b$ 是 score beat 网格起点。因此 score onset 理论上位于 $[0,1)$；它描述乐谱中的拍内位置，不是演奏偏移。Performance onset 则使用前文的 performance beat anchor 和实际 beat duration 计算，二者的差异才包含演奏时序偏移、和弦滚奏和 beat 映射误差。
+
+为了把拍内位置与演奏偏移分开，再定义 onset deviation：
+
+$$
+d_i^{\mathrm{onset}}=u_i^{\mathrm{perf}}-u_i^{\mathrm{score}}.
+$$
+
+$d=0$ 表示演奏起音位于乐谱预期的同一拍内位置；$d>0$ 表示相对 score 拍内位置延后，$d<0$ 表示提前。这里的 dev 是比例坐标之差，不是 duration 的对数偏差。
+
 | 统计量 | 比例 |
 |---|---:|
-| Note onset 样本数 | 384,954 |
-| 早于估计拍点 | 95,412（24.79%）|
-| 与估计拍点重合 | 8.39% |
-| 位于 `[0, 1]` 当前拍范围 | 75.20% |
+| Note onset 有效样本数 | 384,559 / 384,954（99.90%）|
+| Score note onset 均值 / 中位数 | 0.217 / 0.000 |
+| Score note onset 1 / 5 / 95 / 99 分位数 | 0.000 / 0.000 / 0.750 / 0.833 |
+| Score note onset 在 `[0,1]` | 100.00% |
+| Score note onset 恰为 0 | 57.89% |
+| Onset deviation 均值 / 中位数 | -0.0035 / 0.000 |
+| Onset deviation 1 / 5 / 95 / 99 分位数 | -0.254 / -0.117 / 0.106 / 0.227 |
+| Onset deviation 小于 0 | 47.80% |
+| Onset deviation 恰为 0 | 8.87% |
+| 早于估计拍点 | 95,267（24.77%）|
+| 与估计拍点重合 | 8.40% |
+| 位于 `[0, 1]` 当前拍范围 | 75.22% |
 | 晚于下一拍边界（`>1`） | 0.0099%（38 个音符）|
-| 中位数 | 0.040（4.0%）|
-| 5 / 95 分位数 | -0.061 / 0.747 |
-| 1 / 99 分位数 | -0.174 / 0.861 |
+| performance onset ratio 中位数 | 0.040 |
+| performance onset ratio 5 / 95 分位数 | -0.061 / 0.747 |
+| performance onset ratio 1 / 99 分位数 | -0.174 / 0.861 |
 
-负值的幅度并不都很大。按实际局部拍长分箱，`-1%–0%` 有 **7.08%**，`-10%–-1%` 有 **15.11%**，`-25%–-10%` 有 **2.08%**，小于 `-25%` 有 **0.51%**；零点占 **8.39%**。负值可能来自音符起音早于映射拍点，也可能来自同和弦各音的滚奏差异及对齐噪声，不能统称为“提前演奏”。
+负值的幅度并不都很大。按实际局部拍长分箱，`-1%–0%` 有 **7.07%**，`-10%–-1%` 有 **15.11%**，`-25%–-10%` 有 **2.08%**，小于 `-25%` 有 **0.51%**；零点占 **8.40%**。其中 performance onset ratio 小于 0 的比例为 24.77%，与 onset deviation 小于 0（47.80%）不同：后者还减去了 score 中原有的拍内位置。
 
 按区间查看，下面的比例均以全部音符为分母；`0–10%` 区间包含恰好位于拍点的音符：
 
 | Note onset 比例区间 | 音符比例 |
 |---|---:|
-| `<0` | 24.79% |
-| `0–10%` | 30.91% |
+| `<0` | 24.77% |
+| `0–10%` | 30.90% |
 | `10–25%` | 6.52% |
 | `25–50%` | 15.85% |
 | `50–75%` | 17.21% |
@@ -96,15 +120,27 @@ $$
 | `100–125%` | 0.0119% |
 | `>125%` | 0.0018% |
 
-![Note-token onset ratio distribution](../analysis/design1115_note_token_onset_ratio.png)
+![Note onset ratio and deviation distributions](../analysis/design1115_note_onset_ratio_dev.png)
 
-负值表示 note 起音早于 ScorePerformer 映射出的该拍边界，不表示 MIDI 无效。正值大多落在当前拍内。图中横轴裁切在 note `[-1,2]`、beat `[0,3]`；被裁切样本数会标在图内，精确数据保存在统计 JSON 中。使用 onset-group 均值和已有线性插值流程后，超过 1 的比例为 38/384,954。
+下面把 score note onset 与 performance note onset 放在同一张图中。两者使用相同的 beat 内比例坐标，但 performance 分布允许小于 0 或略大于 1；score 分布则由 score 网格约束在 `[0,1)`。
 
-`u<0` 表示 note 起音早于 ScorePerformer 映射出的所属 score beat 边界；`u>1` 表示它晚于下一拍边界。这些值是**未环绕的连续拍坐标**，不是限制在单拍内的相位角。大于 1 不会自动把音符重新归入下一拍，因为 note 仍按 score 对齐关系归属原拍。负值还包含同一 score onset group 内的和弦滚奏差异。
+![Score and performance note onset ratio distributions](../analysis/design1115_score_perf_note_onset_ratio.png)
+
+负值表示 note 起音早于按 onset-group 均值映射出的该拍边界，不表示 MIDI 无效。正值大多落在当前拍内。图中横轴裁切在 note `[-1,2]`、beat `[0,3]`；被裁切样本数会标在图内，精确数据保存在统计 JSON 中。performance onset ratio 超过 1 的比例为 38/384,559。
+
+`u<0` 表示 note 起音早于按 onset-group 均值映射出的所属 score beat 边界；`u>1` 表示它晚于下一拍边界。这些值是**未环绕的连续拍坐标**，不是限制在单拍内的相位角。大于 1 不会自动把音符重新归入下一拍，因为 note 仍按 score 对齐关系归属原拍。负值还包含同一 score onset group 内的和弦滚奏差异。
 
 ### 3.3 Note onset 范围建议
 
-不要把 onset 强制限制在 `[0,1]`：当前约 24.79% 的样本小于 0，零点前后的负值是有意义的。首轮实验把 `[-0.25,1]` 均匀划分为 500 个 token，区间外值裁到最近端点并记录裁剪比例。该区间覆盖约 99.48% 样本；1%–99% 分位数为 `[-0.174,0.861]`。裁剪策略会损失少量尾部差异，后续可单独比较 tail-token 方案。
+不要把 onset 强制限制在 `[0,1]`：performance onset ratio 约 24.77% 小于 0。首轮实验把 `[-0.25,1]` 均匀划分为 500 个 token，区间外值裁到最近端点并记录裁剪比例。performance onset ratio 的 1%–99% 分位数为 `[-0.174,0.861]`，落在建议区间内；实际端点裁剪比例仍应直接按 ratio 标签统计，不能从 onset deviation 的分布代替。
+
+### 3.4 用新映射重算 1112 代表实验
+
+1112 的 `separate_timestep_abs5000` 与 `pure_coord_mlp64` 使用同一 beat 映射和同一套四项指标重新评估，训练 checkpoint、生成 MIDI 和三轮 sampling 均未改变。它们与本轮 1115 设置的结果统一列在 [exp1115 四项指标表](exp1115_BEAT.md#4-四项-score-event-指标)，避免拆成不同评估表。
+
+四项指标的坐标为：onset 使用 `u_perf-u_score` 的 beat-ratio dev，duration 使用 `ln(D_perf/D_score)`，velocity 使用原始 MIDI velocity；W1 在每个 score note 上逐一比较预测值与同一 note 的人类参考值，再对 note 和作品宏平均。因为 onset ratio 与 dev 对同一 note 只是共同平移，二者的 PN W1 应一致。
+
+有效 beat interval 覆盖率按每个 score event 计算，两个方法的三轮平均约为 `99.8%`（各作品范围约 `99.5%–100.0%`）。少量 unsupported interval 被排除，不通过端点外推补齐。
 
 ## 4. Duration 统计
 
@@ -164,7 +200,7 @@ $$
 
 score/performance absolute-log 输入词表可以在 beat 与 note duration 之间 shared 或 separate。若使用 log-dev 输出，其输出 token 表表示偏差，应与 absolute-log 输入表 separate；shared/separate 以及 absolute-log/log-dev 都应通过相同训练协议进行消融。
 
-统计协议、分位数和逐曲目结果见 [`../analysis/design1115_beat_stats.json`](../analysis/design1115_beat_stats.json)，可由 [`../../script/analyze_beat_relative_onsets.py`](../../script/analyze_beat_relative_onsets.py) 重算。当前分析直接使用 score MIDI 的 time signature 生成 beat 网格。
+统计协议、分位数和逐曲目结果见 [`../analysis/design1115_beat_stats.json`](../analysis/design1115_beat_stats.json)，可由 [`../../script/analyze_beat_relative_onsets.py`](../../script/analyze_beat_relative_onsets.py) 重算。统计 JSON 不放在 `docs/`；统计脚本和离线评估共用 [`../src/data_process/beat_mapping.py`](../src/data_process/beat_mapping.py) 中的 onset-group 均值映射实现。
 
 ## 6. Token 与解码结构
 
@@ -179,40 +215,31 @@ NOTE(...)
 ...
 ```
 
-两类事件使用不同的属性组合，但都采用属性 embedding 相加：
+两类事件使用不同的属性组合，但都采用属性 embedding 相加。BEAT 本身由专用的 `beat embedding` 表示；有 `measure_start` 时这张表有两个 token，无区分时只有一个 token，不再额外叠加独立的 `e_beat`：
 
 $$
-h^{\mathrm{beat}}=e_{\mathrm{beat}}+e_{\mathrm{score\_duration}}+e_{\mathrm{measure\_start}},
+h^{\mathrm{beat}}=E_{\mathrm{beat}}[m]+e_{\mathrm{score\_duration}},
 $$
 
 $$
 h^{\mathrm{note}}=e_{\mathrm{pitch}}+e_{\mathrm{score\_duration}}+e_{\mathrm{score\_onset}}+e_{\mathrm{score\_velocity}}.
 $$
 
-事件类型必须显式编码。实际输入向量还应加上 type embedding，或使用彼此独立且有明确 type ID 的 `BEAT` 与 `NOTE` 向量；不能从 duration 数值或 hidden state 猜 token 类型。经过 encoder/decoder 后，按原序列的 type mask 将 beat hidden states 和 note hidden states 分别路由到对应输出目标：beat 状态只监督 performance beat duration，note 状态监督 note duration、onset 和 velocity。这样同一长度事件序列中的两类位置有确定的输出对齐关系。
+事件类型仍保存在每个事件的显式 type 字段中，并用于 attention、mask 和输出路由；但 BEAT 的输入身份由 `beat embedding` 承担，不能再叠加另一份独立的 BEAT type 向量。NOTE 使用 NOTE role embedding 及其属性 embedding。经过 encoder/decoder 后，按原序列的 type mask 将 beat hidden states 和 note hidden states 分别路由到对应输出目标：beat 状态只监督 performance beat duration，note 状态监督 note duration、onset 和 velocity。
 
-建议首版**共享 duration 输入数值 embedding 表，使用独立的 beat-duration 与 note-duration 输出 head**。共享输入表让相同的 log-duration 数值具有相同表示；独立 head 则允许 beat tempo 与 note articulation 学到不同的条件分布。若输出均采用同一种 duration 数值定义和相同 token 边界，也可以共享 duration 输出投影矩阵，但必须保留 type-conditioned bias 或小型 role projection；完全不区分 beat/note 的单一输出 head 不作为首选。可将“共享输出 head”与“独立输出 head”作为后续消融，单独判断参数共享的影响。
+实验默认使用独立的 beat/note duration 输入表和独立输出 head。共享输入表是参数压缩消融；独立 head 允许 beat tempo 与 note articulation 学到不同的条件分布。当前结果中 shared-conditioned output head 明显退化，因此不作为默认。
 
 BEAT 的 `score_duration` 是当前 score beat 到下一个 score beat 的 score 时长；BEAT head 输出对应的 performance beat duration。NOTE 的 `score_duration` 是 score 音符时值；NOTE decoder 输出 performance duration/onset/velocity。`measure_start=1` 表示该 beat 是小节第一拍，其他 beat 为 0。拍号、拍内位置等上下文可以继续作为 score-side feature，不需要单独的 BAR 事件。
 
-同一 beat 下的所有 note 按既有确定性顺序排列，但不能在窗口中间切开 beat。一个训练 window 满足：
-
-1. 第一个 token 必须是 `BEAT`；
-2. 后面跟随该 beat 及后续 beat 的 note，直到达到 note 数量上限；
-3. 最后一个 token 必须是 `NOTE`；下一个 token 要么是下一个 `BEAT`，要么是序列结束；
-4. 不能在同一 beat 的 note 集合中间截断。
-
-窗口长度约束应以 note 数量为主，beat token 作为额外开销。这样每个样本都拥有完整的 beat 起点，且 beat duration 不会因窗口边界被拆开。
-
-encoder 输入和 decoder 目标都包含 beat 与 note，因此一个 window 的事件序列长度都是 `N_note + N_beat`（teacher-forcing 的 decoder 输入通常是右移后的序列，另加 BOS）。每个位置根据显式 type mask 路由到对应输出：BEAT 位置预测 performance beat duration，NOTE 位置预测 performance note duration/onset/velocity。BEAT 输出累积成 performance beat anchors，再用于还原 note onset。这样 beat 与 note 共享事件拓扑，但使用不同的输出 head。
+同一 beat 下的 note 仍按既有确定性顺序排列，但窗口不再要求从 BEAT 开始，也不要求在 beat 边界截断。一个 window 直接取连续的 512 个 BEAT/NOTE 总事件，允许切开同一 beat；每条演奏独立切分，尾部不足 512 时 padding 到 512。encoder 输入和 decoder 目标的张量长度固定为 512，padding 不参与 attention 和 loss。每个位置根据显式 type mask 路由到对应输出：BEAT 位置预测 performance beat duration，NOTE 位置预测 performance note duration/onset/velocity。生成后按原始事件顺序拼回完整作品，再累计 beat duration 还原 note onset。
 
 同一拍内的和弦音共享拍坐标，不再以最低音或前一个和弦音作起音锚点。note onset 标签彼此独立地相对 beat 起点计算；生成后按还原出的绝对起音时间排序 MIDI。
 
 ## 7. 采用的现有流程
 
-不另行实现 beat detector。复用仓库已有的 ScorePerformer `get_bar_beat_ticks` 与 `get_performance_beats`：前者按 score 拍号生成拍网格；上游把同 musical onset 的已演奏音符聚合成一个 onset pair，当前 ScorePerformer SPMuple 实现取这些音符 performance onset 的均值；后者在 beat 边界精确命中 onset pair 时取对应时间，否则在相邻 pair 之间线性插值，并可启用单调时间过滤。
+不另行实现 beat detector。`get_bar_beat_ticks` 按 score 拍号生成 score beat 网格；performance beat anchors 使用本项目的简单规则：同 score onset 音符的 performance onset 取均值，score beat 边界在这些 onset-group 均值之间线性插值。边界必须位于首末观测 onset group 范围内；不作端点外推，也不作 tempo 阈值或单调过滤。实现见 [`../src/data_process/beat_mapping.py`](../src/data_process/beat_mapping.py)。
 
-因此它不会在一个 chord 中挑最低音或第一条 note 来代表整拍。onset 组聚合的均值仍可能受和弦滚奏影响，但确定且无 pitch-order bias。对于 score beat 落在两个 onset groups 之间、或该拍没有音符的情况，线性映射给出其 performance 时间，不需要为每拍找一个真实 note。
+该算法不会在一个 chord 中挑最低音或第一条 note 来代表整拍。均值可能受和弦滚奏影响，但不会引入 pitch-order bias。score beat 落在两个 onset groups 之间时由线性插值确定；若拍边界超出可观测 onset 范围则该 interval 标记为 unsupported，不伪造拍点。
 
 在当前方案中，beat-duration head 预测 beat duration，note onset 头使用 500-bin 有序离散分布预测带符号的 `u`，note-duration 头预测 `ln(D^{perf}/D^{score})` 并按 score 时值还原。onset 固定使用 `[-0.25,1]`，区间外值裁到端点并记录比例；若后续使用连续头，仍需对错配标签做稳健处理。
 
@@ -226,11 +253,11 @@ encoder 输入和 decoder 目标都包含 beat 与 note，因此一个 window �
 
 ## 9. 实验队列与比较设置
 
-当前 IOI 以相邻音符或起音组为参照；新方案以 score beat 网格作为显式输入，同时预测 beat-level performance duration 和 note 相对 beat 的起音位置。它让同拍和弦使用统一坐标，并显式建模 performance tempo curve，但不保证 HR、Wasserstein 或听感一定变好。
+当前 IOI 以相邻音符或起音组为参照；新方案以 score beat 网格作为显式输入，同时预测 beat-level performance duration 和 note 相对 beat 的起音位置。它让同拍和弦使用统一坐标，并显式建模 performance tempo curve。模型效果通过 tempo curve Pearson、note onset W1、note duration W1 和 velocity W1 评估。
 
 ### 9.1 固定协议
 
-所有队列使用相同的数据划分、窗口上限、优化器、学习率、训练 epoch、early stopping 和随机种子组。窗口以 note 数量为主约束，首 token 为 `BEAT`，末 token 为 `NOTE`，不能在一个 beat 的 note 集合中间切割。
+所有队列使用相同的数据划分、优化器、学习率、训练 epoch 和 early stopping。窗口固定为连续 512 个 BEAT/NOTE 总事件，步长 512、无重叠；允许 NOTE-first 和在 beat 内截断，尾窗 padding 到 512。
 
 数值目标固定为 500 个 bins：
 
@@ -250,7 +277,7 @@ encoder 输入和 decoder 目标都包含 beat 与 note，因此一个 window �
 | A2 | 有 | 有 | log-dev | beat/note shared | beat/note separate | 比较 absolute-log 与 score-relative target |
 | A3 | 有 | 无 | absolute-log | beat/note shared | beat/note separate | `measure_start` 消融 |
 
-A0 已有 legacy note-only 结果，本轮不重新训练；旧目标与 beat 目标不同，不作为严格的单因素对照。A1 与 A2 判断输出采用 absolute-log 还是 log-dev；A1 与 A3 判断小节第一拍标记是否提供额外信息。A1、A2、A3 均使用相同的三个随机种子组。
+A1 与 A2 判断输出采用 absolute-log 还是 log-dev；A1 与 A3 判断小节第一拍标记是否提供额外信息。当前固定 512 队列每个设置只训练一次，采样仍进行三轮。
 
 ### 9.3 队列 B：duration 输入表共享
 
@@ -289,13 +316,13 @@ C2 是可行的共享方案；C3 只作为诊断，不作为默认实现，因�
 
 ### 9.6 评估与选择规则
 
-每个设置至少使用三个随机种子。报告 valid loss、beat duration log/ratio 误差、note onset token accuracy 与 signed error、note duration 误差、生成后的 token-level timing JS、PP/PN 和 HR；同时检查 teacher-forced 与 autoregressive 输出。
+报告 valid loss、beat duration log/ratio 误差、score/performance note onset 统计、note onset token accuracy 与 signed error、note duration 误差，并对 AR 输出统一计算四项 score-event PN 指标：tempo curve Pearson、onset W1、duration W1、velocity W1。当前固定 512 队列每个设置一次训练，三次 sampling 的标准差不代表训练随机性。
 
-模型选择不只看总 valid loss。先确认 beat duration、note onset、note duration 三个 head 均没有明显退化，再比较 autoregressive timing JS、beat anchor 重建误差和 HR。若 valid loss 与 HR 或 JS 方向不一致，保留全部指标，不用单一指标强行排序。
+模型选择不只看总 valid loss。先确认 beat duration、note onset、note duration 三个 head 均没有明显退化，再比较四项 PN 指标和 beat anchor 重建误差。若 valid loss 与这些生成指标方向不一致，保留全部指标，不用单一指标强行排序。
 
 窗口重建必须验证 score beat 到 note 的归属、performance beat anchors 的连续性、note 绝对起音、跨 beat 顺序、音符对齐、拍号变化、弱起、休止，以及 `u<0` 或 `u>1` 的音符。
 
-不能只凭 valid loss 选型；此前实验已观察到 loss 与 HR 不总是同向。首要检验点是两级时间表示是否更清晰且更易学习，质量结论仍需多随机种子及 held-out 指标支持。
+模型选择同时报告 valid loss 和四项 held-out score-event 指标：tempo curve Pearson、note onset W1、note duration W1、velocity W1。固定 512 队列每项只有一次训练，sampling 波动不能替代训练 seed 波动。
 
 ## 10. 实现协议与实际运行（2026-11-16）
 
@@ -305,11 +332,11 @@ C2 是可行的共享方案；C3 只作为诊断，不作为默认实现，因�
 
 四个 head 的 CE 分别在其有效事件上求均值，再等权相加：beat duration、note duration、note onset、note velocity。PAD 不参与 loss。模型及所有数值表从随机权重初始化，不加载 PT rendering checkpoint。duration 输出可逐类型独立设置，覆盖 D1/D2；log-dev 输出加回未量化的 score log duration，再量化成 absolute-log 后用于下一步 decoder 历史输入。所有模型使用相同的 500-token 数值范围和量化器。
 
-本轮 decoder mask 沿用 timestep 的完整事件遮蔽：训练时每个非 BOS/PAD 的历史事件以 0.5 概率由一个可学习 mask 向量替换，包含该历史 note 的 pitch；验证与推理不遮蔽。score encoder 信息始终完整。duration shared 输入表按 beat/note 类型使用同一张 500 行表；separate 使用两张独立表。默认分开 beat/note 输出 head，C2 为共享投影加类型 bias，C3 无额外类型 bias/role projection。
+本轮 decoder mask 沿用 timestep 的完整事件遮蔽：训练时每个非 BOS/PAD 的历史事件以 0.5 概率由一个可学习 mask 向量替换，包含该历史 note 的 pitch；验证与推理不遮蔽。score encoder 信息始终完整。duration shared 输入表按 beat/note 类型使用同一张 500 行表；separate 使用两张独立表。BEAT 输入使用一张专用 beat embedding 表：有 measure_start 时两个 token，无区分时一个 token，不再叠加独立的 BEAT type embedding。输出 head 分开路由 beat/note。
 
 ### 10.2 冻结 sidecar 与完整性审计
 
-数据写到外层 `data/ASAP_processed_dinr_beat_v1/`；sidecar 保存连续值，训练按配置量化，不为每项设置复制整份数据。work-level held-out 12 首验证集与旧协议一致，三种 split 在作品级互不重叠。
+数据写到外层 `data/ASAP_processed_dinr_beat_e512_v1/`；sidecar 保存连续值，训练按配置量化，不为每项设置复制整份数据。work-level held-out 12 首验证集与旧协议一致，三种 split 在作品级互不重叠。
 
 | split | 作品 | 演奏 | 唯一 note | BEAT 事件 | 窗口 |
 |---|---:|---:|---:|---:|---:|
@@ -317,11 +344,11 @@ C2 是可行的共享方案；C3 只作为诊断，不作为默认实现，因�
 | valid | 12 | 47 | 135,467 | 24,132 | 507 |
 | test | 19 | 82 | 384,954 | 95,378 | 1,479 |
 
-窗口上限为 512 note，首事件是 BEAT、末事件是 NOTE，不能拆分同一 beat；完整保留窗口内部的无音符拍。相邻训练窗口约 50% note 重叠，实际起点落在 beat 边界。所有 note 均至少被一个窗口覆盖。最大事件长度分别是 train 811、valid 747、test 771；它大于 note 上限是因为还包含 BEAT 事件。
+1115 固定协议使用 512 个 BEAT/NOTE 总事件，步长 512、无重叠，允许 NOTE-first 窗口和拍内截断；每个尾窗 padding 到 512。新 sidecar 中 train/valid/test 分别为 6,561 / 329 / 974 个窗口，所有事件恰好覆盖一次。固定长度不是 512 个 note；BEAT 事件包含在这 512 个位置内。
 
-Beat mapper 复用 ScorePerformer 的 onset-group performance 均值和线性插值；**调用 mapper 时将毫秒转成秒**，返回后转回毫秒，以匹配其 tempo-600 单调过滤阈值。这修正了初步统计脚本直接传毫秒导致的单位不一致，因此本轮裁剪比例以冻结 sidecar 的审计结果为准，不能直接把前文初步统计当成完全相同的数据版本。
+训练 sidecar 仍按当时冻结的数据构建流程生成；本次刷新的是统计图表和离线评估，使用无 tempo 阈值过滤、无单调过滤、无端点外推的新 onset-group 映射。这里没有重建 sidecar 或重训模型。新统计只覆盖具有完整、正时长映射 beat interval 的样本，因此有效数量略少于总 test note 数。
 
-测试沿用旧评估中两首 MS-score 的 MUSICAL51 fallback，避免漏掉测试作品。其标签未经过 grouped-median 归一化；其他作品保留已有 grouped-median 标签。每个来源的时间归一化元信息保存在 sidecar 中；本轮不悄悄改变这两首的归一化规则。完整裁剪统计与文件 SHA256 见 [数据审计](design1115_beat_data_audit.json)，重算入口为 [`audit_dinr_beat.py`](../script/audit_dinr_beat.py)。
+测试沿用旧评估中两首 MS-score 的 MUSICAL51 fallback，避免漏掉测试作品。其标签未经过 grouped-median 归一化；其他作品保留已有 grouped-median 标签。每个来源的时间归一化元信息保存在 sidecar 中；本轮不悄悄改变这两首的归一化规则。完整裁剪统计与文件 SHA256 保存在分析目录，重算入口为 [`audit_dinr_beat.py`](../script/audit_dinr_beat.py)。
 
 500-token 端点裁剪比例（包括下界与上界，连续值仍保存在 sidecar）：
 
@@ -335,38 +362,37 @@ Beat mapper 复用 ScorePerformer 的 onset-group performance 均值和线性插
 
 ### 10.3 三卡完整队列与依赖
 
-A0 不运行。每项设置三个独立训练种子，因此计划共 **12 项设置、36 次训练**；每个最佳模型额外做三轮测试采样。A1/A2/A3/B1/B2/C2/C3/D1/D2/D4 使用训练种子 42、43、44；D3/D5 为独立复验，使用 45、46、47。采样标准差和训练标准差分别记录，不把“三次采样”当成“三次训练”。
+A0 不运行。当前固定 512 协议的 A/B/D 队列共 **10 项设置、每项一次训练**；每个最佳模型额外做三轮测试采样。训练使用 microbatch=16、gradient accumulation=2，有效 batch=32。采样标准差只描述三轮 sampling，不等同于训练 seed 标准差。
 
-1. 第一阶段运行 A1/A2/A3/B1/B2，共 15 次训练。
-2. C1 复用对应的 A1/A2 结果；C2/C3 在 A1/A2 中选择更好的 duration target，共 6 次训练。
-3. D1/D2 使用 shared 输入表、separate 输出 head，分别比较 beat absolute-log + note log-dev 与 beat log-dev + note absolute-log，共 6 次训练；本轮两个组合都运行。
-4. 在 A1/A2/D1/D2 中选择 duration target 组合。D3 对该 shared 输入表 + separate head 组合独立复验；D4 使用相同 duration target，改为 separate 输入表 + shared conditioned head，共 6 次训练。
-5. 在 A–D4 中选择表现更好的设置，D5 翻转该设置的 `measure_start` 属性作独立复验，共 3 次训练。
+1. 第一阶段运行 A1/A2/A3/B1/B2/D1/D2，共 7 次训练。
+2. 在 A1/A2/D1/D2 中按 valid 物理分数选择 target，运行 D3 和 D4。
+3. 在 A–D4 中选择表现更好的设置，D5 翻转该设置的 `measure_start` 属性；C2/C3 不运行。
 
-为了使自动队列可复现，以上配置选择只采用 **valid 贪心预测的物理误差**，不查看 test：beat duration log MAE、note duration log MAE、note onset ratio MAE、velocity MAE/127 四项的平均值，再跨三个训练种子求均值。模型 checkpoint 的选择仍按最低总 valid CE。这个分数是预先约定的队列控制规则，不宣称取代全部生成质量指标；各 head、JS、HR 仍完整报告。
+为了使自动队列可复现，以上配置选择只采用 **valid 贪心预测的物理误差**，不查看 test：beat duration log MAE、note duration log MAE、note onset ratio MAE、velocity MAE/127 四项的平均值。模型 checkpoint 的选择仍按最低总 valid CE。最终 held-out 结果使用 tempo curve Pearson、note onset W1、note duration W1、velocity W1。
 
-全部设置最大 16 epoch；每半 epoch 验证一次；patience=4；只保留最低 valid checkpoint。AdamW，初始 LR 3e-4、线性衰减、无 warmup，weight decay=0，有效 batch=32（microbatch=8、累积=4）。若出现显存不足，队列将 microbatch 减为 4、累积增为 8，保持有效 batch 不变并记录。每次 optimizer update 保存 train loss，验证点单独记录。
+全部设置最大 16 epoch；每半 epoch 验证一次；patience=4；只保留最低 valid checkpoint。AdamW，初始 LR 3e-4、线性衰减、无 warmup，weight decay=0，有效 batch=32（microbatch=16、累积=2）。固定 512 长度下不自动改 batch；末尾不足 accumulation 的更新按实际 microbatch 数归一化。每次 optimizer update 保存 train loss，验证点单独记录。
 
 ### 10.4 评估、生成与结果归档
 
 [`evaluate_dinr_beat.py`](../src/evaluate/evaluate_dinr_beat.py) 包含 valid 贪心诊断、teacher-forced 与 autoregressive 采样。测试保留 19 首作品和全部 82 个对齐参考演奏；每个模型三轮采样，temperature=1、top-p=0.9。TF 使用每个真实参考演奏作为历史；AR 只读取 score 和生成历史，绝不使用真实演奏属性。
 
-自回归使用不重叠的完整 beat 窗口，每窗最多 512 note；各窗起点重置 BOS/cache，累计 performance beat 时间跨窗延续。把不同窗口与采样轮次按固定顺序做 batch=16 解码以减少串行开销；随机流以作品标识固定，固定任务顺序和 batch 大小可重放。输出保存原始 token NPZ、事件身份、MIDI、逐作品和逐轮指标。
+自回归使用不重叠的固定 512 总事件窗口，允许 NOTE-first 和拍内截断；各窗起点重置 BOS/cache，预测后按原始事件顺序拼回完整作品，再累计 performance beat 时间。把不同窗口与采样轮次按固定顺序做 batch=16 解码；随机流以作品标识固定。输出保存原始 token NPZ、事件身份、MIDI、逐作品和逐轮指标。
 
-Token JS 在 500-bin duration、500-bin onset 和 128-bin velocity 上计算，单位为 nats；误差与 beat anchor 还原始终保留 score event 对齐。播放 MIDI 按还原后的实际 onset 排序；若起音小于零，对整个片段做共同平移，不单独把提前音压到零。Legacy PN/PP W1 与 HR 另按 time-sorted MIDI note index 计算，并沿用旧的固定 human anchor；它与 event-aligned token 指标属于不同对齐协议，报告中明确区分。PP 保留 W1，不虚构未校准的 PP HR。
+四项指标都保留 score event 身份，并在每个 note 上与同一 note 的人类参考比较。onset W1 使用每个 note 的 `u_perf-u_score`，duration W1 使用 `ln(D_perf/D_score)`，velocity W1 使用 MIDI velocity 原值；tempo curve Pearson 比较逐作品 beat-level log-tempo 与人类参考中位曲线。播放 MIDI 按还原后的实际 onset 排序；若起音小于零，对整个片段做共同平移，不单独把提前音压到零。
 
-[实验结果与曲线](exp1115_BEAT.md) 由队列自动刷新。主表对三个独立训练种子报告 mean ± sample std（小数三位），每个种子的 HR 先平均其三轮采样；CSV 另保留各模型采样标准差。曲线按 A/B/C/D 分为四列两行，横轴自适应该组实际最大 epoch。README 直接嵌入同一张图。
+
+[实验结果与曲线](exp1115_BEAT.md) 由队列自动刷新。主表对每个设置报告三轮 sampling 的 mean ± sample std（小数三位）；这不是训练 seed 标准差。曲线按 A/B/D 分为三列两行，横轴自适应该组实际最大 epoch。README 直接嵌入同一张图。
 
 ### 10.5 监督运行与恢复
 
-队列入口为 [`run_dinr_beat_queue.py`](../script/run_dinr_beat_queue.py)，运行在 GPU0/1/2；每张卡一次一个任务，依次执行训练、valid、TF/AR 测试、指标归档和图表更新。manifest 保存 PID、心跳、阶段、退出码和自适应配置选择依据；禁止重复启动同一队列。评估可从已完成作品恢复，失败任务保留日志，依赖阶段不会把缺失结果当成完成。
+队列入口为 [`run_exp1116_beat_queue.py`](../script/run_exp1116_beat_queue.py)，运行在 GPU0/1/2；每张卡一次一个任务，依次执行训练、valid、TF/AR 测试、指标归档和图表更新。manifest 保存 PID、心跳、阶段、退出码和配置选择依据；禁止重复启动同一队列。评估可从已完成作品恢复，失败任务保留日志，依赖阶段不会把缺失结果当成完成。
 
 ```bash
 cd INSPIRE2
 python -m src.data_process.build_dinr_beat_sidecars
 python script/audit_dinr_beat.py
 python -m unittest discover -s tests -p test_dinr_beat.py -v
-python script/run_dinr_beat_queue.py --gpus 0 1 2
+python script/run_exp1116_beat_queue.py --gpus 0 1 2
 ```
 
-运行目录为外层 `results/exp1115_beat/`；数据、checkpoint 和运行日志保存在本地，仅 INSPIRE2 内层仓库包含实现、审计、设计及结果文档，不提交外层仓库。
+运行目录为外层 `results/exp1116_beat/`；数据、checkpoint 和运行日志保存在本地，仅 INSPIRE2 内层仓库包含实现、审计、设计及结果文档，不提交外层仓库。

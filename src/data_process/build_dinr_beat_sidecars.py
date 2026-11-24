@@ -13,6 +13,9 @@ import torch
 from miditoolkit import MidiFile
 
 from src.data_process.dinr_dataset import _sidecar_paths
+from src.data_process.beat_mapping import (
+    map_score_beats, map_score_beats_structural_earliest, valid_beat_intervals,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -106,7 +109,7 @@ def performance_beat_anchors(score_ticks, score_beat_edges, perf_onsets,
 
 
 def make_event_stream(score, performance, score_midi, get_bar_beat_ticks,
-                      get_performance_beats):
+                      get_performance_beats, anchor_method="onset_group_mean"):
     notes = score_notes(score_midi)
     score_pitch = np.asarray(score["pitch"], dtype=np.int64)
     score_raw = np.asarray(score["score_raw"], dtype=np.float64)
@@ -122,17 +125,32 @@ def make_event_stream(score, performance, score_midi, get_bar_beat_ticks,
     edges, beat_ticks, score_beat_ms, beat_lookup, measure_start = grid
     score_ticks = np.asarray([note.start for note in notes], dtype=np.int64)
     perf_onsets = np.cumsum(raw[:, 0])
-    anchors = performance_beat_anchors(
-        score_ticks, edges, perf_onsets, get_performance_beats, score_midi.ticks_per_beat
-    )
-    perf_beat_ms = np.maximum(np.diff(anchors), 1.0)
+    mapper = (map_score_beats_structural_earliest if anchor_method == "structural_earliest"
+              else map_score_beats)
+    if anchor_method not in ("onset_group_mean", "structural_earliest"):
+        raise ValueError(f"Unknown beat anchor method: {anchor_method}")
+    anchors, supported = mapper(edges, score_ticks, perf_onsets)
+    valid_intervals, mapped_durations = valid_beat_intervals(anchors, supported)
+    # Unsupported leading/trailing beat intervals contain no reliable paired
+    # onset anchor. Keep their event topology, but exclude their onset target
+    # from loss and use score duration as a neutral duration fallback.
+    # Keep score timing immutable: event inputs must be identical across
+    # performances of the same work.  A view here would let performance
+    # durations overwrite the score beat durations in ``score_beat_ms``.
+    perf_beat_ms = np.array(score_beat_ms, dtype=np.float64, copy=True)
+    valid_duration = valid_intervals & np.isfinite(mapped_durations)
+    perf_beat_ms[valid_duration] = np.maximum(mapped_durations[valid_duration], 1.0)
     if len(perf_beat_ms) != len(beat_ticks):
         raise ValueError("Beat mapper returned wrong number of beat intervals")
     note_beat_ids = np.searchsorted(beat_ticks, score_ticks, side="right") - 1
     note_beat_ids = np.clip(note_beat_ids, 0, len(beat_ticks) - 1)
     score_beat_lengths = np.diff(edges)
     score_note_onsets = (score_ticks - beat_ticks[note_beat_ids]) / score_beat_lengths[note_beat_ids]
-    note_onset_ratio = ((perf_onsets - anchors[note_beat_ids]) / perf_beat_ms[note_beat_ids])
+    note_onset_dev = np.zeros(len(notes), dtype=np.float64)
+    note_valid = valid_intervals[note_beat_ids]
+    note_onset_ratio = ((perf_onsets - anchors[note_beat_ids]) /
+                        np.maximum(perf_beat_ms[note_beat_ids], 1.0))
+    note_onset_dev[note_valid] = note_onset_ratio[note_valid] - score_note_onsets[note_valid]
     score_note_durations = np.maximum(score_raw[:, 1], 1.0)
     perf_note_durations = np.maximum(raw[:, 1], 1.0)
     score_velocity = np.clip(np.rint(score_raw[:, 2]), 0, 127)
@@ -143,6 +161,7 @@ def make_event_stream(score, performance, score_midi, get_bar_beat_ticks,
         notes_by_beat[beat_id].append(note_index)
     events = []
     targets = []
+    target_valid = []
     beat_event_spans = []
     for beat_id, note_indices in enumerate(notes_by_beat):
         event_start = len(events)
@@ -150,23 +169,28 @@ def make_event_stream(score, performance, score_midi, get_bar_beat_ticks,
         events.append([0, -1, score_beat_ms[beat_id], -1.0, -1, measure_start[beat_id]])
         # [performance duration ms, performance onset ratio, performance velocity]
         targets.append([perf_beat_ms[beat_id], -1.0, -1])
+        target_valid.append([bool(valid_duration[beat_id]), False, False])
         for note_index in note_indices:
             events.append([1, score_pitch[note_index], score_note_durations[note_index],
                            score_note_onsets[note_index], score_velocity[note_index], -1])
-            targets.append([perf_note_durations[note_index], note_onset_ratio[note_index],
+            targets.append([perf_note_durations[note_index], note_onset_dev[note_index],
                             perf_velocity[note_index]])
+            target_valid.append([True, bool(note_valid[note_index]), True])
         beat_event_spans.append((event_start, len(events), len(note_indices)))
     return (torch.tensor(events, dtype=torch.float32),
-            torch.tensor(targets, dtype=torch.float32), beat_event_spans)
+            torch.tensor(targets, dtype=torch.float32),
+            torch.tensor(target_valid, dtype=torch.bool), beat_event_spans)
 
 
-def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("train", "valid", "test")):
+def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("train", "valid", "test"),
+          sidecar_overrides=None, normalization_description=None,
+          anchor_method="onset_group_mean"):
     get_bar_beat_ticks, get_performance_beats = load_beat_mapper()
     heldout = json.loads(manifest_path.read_text(encoding="utf-8"))
     heldout_paths = {row["work_path"] if isinstance(row, dict) else row
                      for row in heldout["valid_work_paths"]}
     for requested_split in splits:
-        all_events, all_targets, samples, performances = [], [], [], []
+        all_events, all_targets, all_target_valid, samples, performances = [], [], [], [], []
         offset = 0
         paths = _sidecar_paths(root)
         if requested_split == "test":
@@ -186,9 +210,11 @@ def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("
             if len(paths) != 19:
                 raise ValueError(f"Expected 19 test works, found {len(paths)}")
         for sidecar in paths:
+            relative_work = sidecar.parent.relative_to(root).as_posix()
+            if sidecar_overrides is not None:
+                sidecar = Path(sidecar_overrides[str(sidecar.resolve())])
             payload = torch.load(sidecar, map_location="cpu", weights_only=False)
             score = payload.get("score") or {}
-            relative_work = sidecar.parent.relative_to(root).as_posix()
             for perf_index, performance in enumerate(payload.get("performances", [])):
                 source_split = str(performance.get("split", ""))
                 is_heldout = relative_work in heldout_paths
@@ -200,10 +226,11 @@ def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("
                 score_path = root / score_source if score_source else sidecar.with_name("score_ASAP_refined.mid")
                 score_midi = MidiFile(str(score_path))
                 stream = make_event_stream(score, performance, score_midi,
-                                           get_bar_beat_ticks, get_performance_beats)
+                                           get_bar_beat_ticks, get_performance_beats,
+                                           anchor_method=anchor_method)
                 if stream is None:
                     continue
-                events, targets, beat_spans = stream
+                events, targets, target_valid, beat_spans = stream
                 note_counts = [span[2] for span in beat_spans]
                 for beat_start, beat_end in canonical_beat_windows(
                         note_counts, block_notes, overlap_ratio):
@@ -230,6 +257,7 @@ def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("
                 })
                 all_events.append(events)
                 all_targets.append(targets)
+                all_target_valid.append(target_valid)
                 offset += len(events)
             del payload
         if not samples:
@@ -238,7 +266,7 @@ def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("
             if requested_split == "test":
                 raise ValueError("No test performances found")
         result = {
-            "format": "dinr_beat_events_v1",
+            "format": "dinr_beat_events_v2",
             "split": requested_split,
             "sidecar_root": str(root.resolve()),
             "valid_work_manifest": str(manifest_path.resolve()),
@@ -246,15 +274,22 @@ def build(root, output_dir, manifest_path, block_notes, overlap_ratio, splits=("
             "overlap_ratio": overlap_ratio,
             "event_fields": ["type", "pitch", "score_duration_ms", "score_onset_ratio",
                              "score_velocity", "measure_start"],
-            "target_fields": ["performance_duration_ms", "performance_onset_ratio",
+            "target_fields": ["performance_duration_ms", "performance_onset_dev",
                               "performance_velocity"],
-            "beat_anchor_protocol": "ScorePerformer mean grouped onset + get_performance_beats linear interpolation and monotonic filtering",
+            "beat_anchor_protocol": (
+                "earliest performance onset in each score onset group; "
+                "interpolate score beat edges between structural onset-group anchors; "
+                "no endpoint extrapolation; unsupported endpoints masked"
+                if anchor_method == "structural_earliest" else
+                "score-onset-group mean + linear interpolation; no monotonic filtering or endpoint extrapolation; unsupported endpoint onset labels are masked"),
+            "onset_target_protocol": "performance beat-relative onset ratio minus score beat-relative onset ratio",
             "events": torch.cat(all_events) if all_events else torch.empty((0, 6)),
             "targets": torch.cat(all_targets) if all_targets else torch.empty((0, 3)),
+            "target_valid": torch.cat(all_target_valid) if all_target_valid else torch.empty((0, 3), dtype=torch.bool),
             "samples": samples,
             "performances": performances,
             "beat_mapper_time_unit": "seconds in mapper; milliseconds in sidecar",
-            "performance_time_normalization": "existing grouped-median labels; two raw MS-score test fallbacks as in exp1112",
+            "performance_time_normalization": normalization_description or "existing grouped-median labels; two raw MS-score test fallbacks as in exp1112",
         }
         output = output_dir / f"dinr_beat_{requested_split}_b{block_notes}_o{int(overlap_ratio * 100)}.pt"
         output.parent.mkdir(parents=True, exist_ok=True)

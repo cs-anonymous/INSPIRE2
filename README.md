@@ -73,7 +73,7 @@ seeds per setting and three sampling rounds per best checkpoint.
 
 [Chinese design and execution protocol](docs/design1115_beat.md) ·
 [Live results and uncertainty](docs/exp1115_BEAT.md) ·
-[Frozen sidecar audit](docs/design1115_beat_data_audit.json)
+[Frozen sidecar audit](analysis/exp1115_beat/fixed_event_data_audit.json)
 
 ## Key Features
 

@@ -50,6 +50,23 @@ class BeatTests(unittest.TestCase):
         no_measure = DINRBeatDataset(self.path, input_measure_start=False)[0]
         self.assertTrue((no_measure['encoder_tokens'][:,5] == 0).all())
 
+    def test_v2_onset_dev_target_and_absolute_history(self):
+        events = torch.tensor([[0,-1,500,-1,-1,1], [1,60,250,.4,64,-1],
+                               [0,-1,500,-1,-1,0], [1,67,250,.2,64,-1]], dtype=torch.float32)
+        targets = torch.tensor([[600,-1,-1], [200,.1,72],
+                                [550,-1,-1], [225,-.1,80]], dtype=torch.float32)
+        path = Path(self.temp.name) / 'events_v2.pt'
+        torch.save(dict(format='dinr_beat_events_v2', events=events, targets=targets,
+                        target_valid=torch.ones_like(targets, dtype=torch.bool),
+                        samples=[dict(span=[0,4])]), path)
+        row = DINRBeatDataset(path)[0]
+        expected = S.quantize(torch.tensor([.1, -.1]), S.onset_dev_range, S.onset_dev_bins)
+        self.assertTrue(torch.equal(row['labels'][[1,3],2], expected))
+        expected_ratio = S.quantize(torch.tensor(.5), S.onset_input_range,
+                                    S.onset_input_bins)
+        self.assertEqual(row['decoder_tokens'][2,3].item(), expected_ratio.item())
+        self.assertEqual(S.onset_dev_bins, 200)
+
     def test_cache_matches_full_and_causal(self):
         batch = DINRBeatCollator()([DINRBeatDataset(self.path)[0]])
         model = self.model().eval()
@@ -73,6 +90,46 @@ class BeatTests(unittest.TestCase):
             changed['decoder_tokens'][:,3:,2] = 10
             future = model(**changed)
             torch.testing.assert_close(full['logits']['duration'][:,:3], future['logits']['duration'][:,:3])
+
+    def test_token_metrics_ignore_masked_beat_and_onset_labels(self):
+        from src.evaluate.evaluate_dinr_beat import token_metrics
+        events = torch.tensor([[0,-1,500,-1,-1,1], [1,60,250,.4,64,-1],
+                               [0,-1,500,-1,-1,0], [1,67,250,.2,64,-1]])
+        reference = np.array([[600,-1,-1],[200,.1,72],[550,-1,-1],[225,-.1,80]])
+        continuous = reference.copy()
+        continuous[0,0] = 100000  # ignored beat label
+        continuous[1,1] = 100000  # ignored onset label
+        labels = torch.tensor([[-100,-100,0],[20,-100,72],[21,-100,0],[22,90,80]])
+        tokens = labels.clamp_min(0)
+        metrics = token_metrics(tokens, labels, events, continuous, reference)
+        self.assertEqual(metrics['beat_duration_log_mae'], 0.)
+        self.assertEqual(metrics['onset_mae'], 0.)
+
+    def test_direct_metrics_retain_continuous_labels_and_masks(self):
+        from script.evaluate_exp1117_beat_dev import work_metrics, decode_numpy
+        events = np.array([[0,-1,500,-1,-1,1],[1,60,250,.4,64,-1],
+                           [0,-1,500,-1,-1,0],[1,62,250,.2,64,-1],
+                           [0,-1,500,-1,-1,0],[1,64,250,.3,64,-1],
+                           [0,-1,500,-1,-1,0],[1,65,250,.6,64,-1]], dtype=float)
+        predictions = np.array([[310,0,0],[250,110,72],[330,0,0],[260,90,75],
+                                [320,0,0],[240,105,70],[340,0,0],[255,115,73]])
+        continuous = np.column_stack((
+            np.exp(decode_numpy(predictions[:,0], S.duration_abs_range, S.duration_bins)),
+            decode_numpy(predictions[:,1], S.onset_dev_range, S.onset_dev_bins),
+            predictions[:,2]))[None,:,:]
+        valid = np.ones_like(continuous, dtype=bool)
+        valid[:,0,0] = False
+        valid[:,1,1] = False
+        continuous[:,1,1] = 999.  # excluded by mask, not clipped to a target bin
+        path = Path(self.temp.name) / 'direct_metrics.npz'
+        np.savez(path, events=events, predictions=predictions[None,:,:],
+                 references=predictions[None,:,:], reference_continuous=continuous,
+                 reference_valid=valid)
+        result = work_metrics(path, {'duration_target':'absolute_log'})
+        self.assertAlmostEqual(result['tempo_curve_pearson'], 1.)
+        for key in ('onset_w1','duration_w1','velocity_w1'):
+            self.assertAlmostEqual(result[key], 0.)
+        self.assertEqual(result['onset_notes'], 3)
 
     def test_backward_routing_and_padding(self):
         ds = DINRBeatDataset(self.path, input_duration_tables='separate')

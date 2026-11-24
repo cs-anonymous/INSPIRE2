@@ -46,7 +46,8 @@ def load_model(checkpoint, device):
     model = DINRBeatModel(config, run['duration_target'], run['duration_input_tables'],
                           run['duration_output_head'], run.get('decoder_mask_probability', .5),
                           use_beat_type_embedding=run.get('beat_type_embedding', True),
-                          measure_start_vocab_size=run.get('measure_start_vocab_size', 2))
+                          measure_start_vocab_size=run.get('measure_start_vocab_size', 2),
+                          onset_target=run.get('onset_target', 'ratio'))
     model.beat_duration_target = run['beat_duration_target']
     model.note_duration_target = run['note_duration_target']
     model.load_state_dict(torch.load(checkpoint / 'pytorch_model.bin', map_location='cpu', weights_only=True))
@@ -60,7 +61,17 @@ def amp(device):
 def dataset_for(sidecar, run):
     return DINRBeatDataset(sidecar, run['duration_target'], run['duration_input_tables'],
                            run['measure_start'], beat_duration_target=run['beat_duration_target'],
-                           note_duration_target=run['note_duration_target'])
+                           note_duration_target=run['note_duration_target'],
+                           onset_target=run.get('onset_target', 'ratio'))
+
+
+def onset_feedback_token(predicted, event, model):
+    bounds = S.onset_dev_range if model.onset_target == 'dev' else S.onset_input_range
+    value = S.dequantize(predicted, bounds, model.onset_head.out_features)
+    if model.onset_target == 'dev':
+        event = torch.as_tensor(event, device=value.device)
+        value = value + event[..., 3]
+    return S.quantize(value, S.onset_input_range, S.onset_input_bins)
 
 
 def decode_duration(tokens, events, model):
@@ -108,16 +119,21 @@ def event_chunks(events, limit=512, max_events=None):
     return chunks
 
 
-def quantized_example(events, targets, run):
+def quantized_example(events, targets, run, target_valid=None):
     # Reuse exactly the training quantizer/shift logic, without writing a file.
     ds = object.__new__(DINRBeatDataset)
-    ds.data = dict(events=events, targets=targets)
+    ds.data = dict(events=events, targets=targets,
+                   format='dinr_beat_events_v2' if run.get('sidecar_format') == 'dinr_beat_events_v2' or run.get('onset_target') == 'dev'
+                   else 'dinr_beat_events_v1')
+    ds.onset_target = run.get('onset_target', 'ratio')
     ds.samples = [dict(span=[0,len(events)])]
     ds.duration_target = run['duration_target']
     ds.beat_duration_target = run['beat_duration_target']
     ds.note_duration_target = run['note_duration_target']
     ds.input_duration_tables = run['duration_input_tables']
     ds.input_measure_start = run['measure_start']
+    ds.target_valid = (torch.ones_like(targets, dtype=torch.bool)
+                       if target_valid is None else target_valid)
     return ds[0]
 
 
@@ -166,7 +182,7 @@ def predict(model, events, targets, run, device, seed, teacher_forced=False, gre
                 previous = encoder[:,i:i+1].clone()
                 duration = decode_duration(row[0],source[i],model)
                 previous[...,2] = S.quantize(duration.log(),S.duration_abs_range,S.duration_bins)
-                previous[...,3] = row[1]
+                previous[...,3] = onset_feedback_token(row[1], source[i], model)
                 previous[...,4] = row[2]
             results.append(torch.stack(predicted).cpu())
     return torch.cat(results)
@@ -209,7 +225,7 @@ def predict_many(model, events, targets, run, device, seeds, batch_size=16):
                 previous=encoder[:,i:i+1].clone()
                 duration=decode_duration(row[:,0],raw[:,i],model)
                 previous[...,2]=S.quantize(duration.log(),S.duration_abs_range,S.duration_bins)[:,None]
-                previous[...,3]=row[:,1,None]
+                previous[...,3]=onset_feedback_token(row[:,1],raw[:,i],model)[:,None]
                 previous[...,4]=row[:,2,None]
         predicted=torch.stack(predicted,dim=1).cpu()
         for index,(sample,left,right) in enumerate(group):
@@ -219,11 +235,12 @@ def predict_many(model, events, targets, run, device, seeds, batch_size=16):
 
 def to_continuous(tokens, events, model):
     duration = decode_duration(tokens[:,0],events,model).cpu().numpy()
-    onset = S.dequantize(tokens[:,1],S.onset_range,S.onset_bins).numpy()
+    onset_bounds = S.onset_dev_range if model.onset_target == 'dev' else S.onset_input_range
+    onset = S.dequantize(tokens[:,1],onset_bounds,model.onset_head.out_features).numpy()
     return np.column_stack((duration,onset,tokens[:,2].numpy()))
 
 
-def absolute_notes(events, continuous):
+def absolute_notes(events, continuous, onset_target='ratio'):
     """Reconstruct beat curve and note times without clipping/reordering notes."""
     e, values = np.asarray(events), np.asarray(continuous)
     beat = e[:,0] == S.beat_type
@@ -231,7 +248,10 @@ def absolute_notes(events, continuous):
     anchors = np.r_[0.,np.cumsum(beat_durations)[:-1]]
     membership = np.cumsum(beat) - 1
     note = ~beat
-    onsets = anchors[membership[note]] + values[note,1] * beat_durations[membership[note]]
+    onset_position = values[note,1]
+    if onset_target == 'dev':
+        onset_position = onset_position + e[note,3]
+    onsets = anchors[membership[note]] + onset_position * beat_durations[membership[note]]
     return np.column_stack((e[note,1],onsets,values[note,0],values[note,2])), anchors
 
 
@@ -275,15 +295,18 @@ def token_metrics(tokens, reference_tokens, events, continuous, reference):
                                ('onset',~beat,1,500),('velocity',~beat,2,128)):
         if not mask.any():
             continue
-        pred, ref = tokens.numpy()[mask,col], reference_tokens.numpy()[mask,col]
+        valid = mask & (reference_tokens[:, col].numpy() >= 0)
+        if not valid.any():
+            continue
+        pred, ref = tokens.numpy()[valid,col], reference_tokens.numpy()[valid,col]
         result[name+'_accuracy'] = float(np.mean(pred == ref))
         result[name+'_js'] = js_counts(pred,ref,bins)
         if col == 0:
-            error = np.log(continuous[mask,0]/reference[mask,0])
+            error = np.log(continuous[valid,0]/reference[valid,0])
             result[name+'_log_mae'] = float(np.abs(error).mean())
-            result[name+'_ratio_mae'] = float(np.abs(continuous[mask,0]/reference[mask,0]-1).mean())
+            result[name+'_ratio_mae'] = float(np.abs(continuous[valid,0]/reference[valid,0]-1).mean())
         else:
-            error = continuous[mask,col]-reference[mask,col]
+            error = continuous[valid,col]-reference[valid,col]
             result[name+'_mae'] = float(np.abs(error).mean())
             result[name+'_signed_error'] = float(error.mean())
     # Window-local diagnostics also allow NOTE-first or NOTE-only windows.
@@ -302,43 +325,57 @@ def token_metrics(tokens, reference_tokens, events, continuous, reference):
 def evaluate_valid(model,run,path,device,limit=None):
     dataset = dataset_for(path,run)
     rows,losses = [],[]
+    component_losses = {name: [] for name in
+                        ('beat_duration', 'note_duration', 'onset', 'velocity')}
     for i in range(min(len(dataset),limit or len(dataset))):
         ex = dataset[i]
         start,end = dataset.samples[i]['span']
-        events,reference = dataset.data['events'][start:end],dataset.data['targets'][start:end].numpy()
+        events,reference = dataset.data['events'][start:end],dataset.data['targets'][start:end].numpy().copy()
+        if dataset.data['format'] == 'dinr_beat_events_v2' and model.onset_target != 'dev':
+            reference[:, 1] += events[:, 3].numpy()
         batch = {k:v.to(device) for k,v in DINRBeatCollator(run.get('fixed_event_length'))([ex]).items()}
         with amp(device):
             output = model(**batch)
         losses.append(float(output['loss']))
+        if output.get('loss_components') is not None:
+            for name, value in output['loss_components'].items():
+                component_losses[name].append(float(value))
         tokens = torch.stack([output['logits'][k][0,:len(events)].argmax(-1).cpu()
                               for k in ('duration','onset','velocity')],dim=-1)
         labels = ex['labels']
         ref_tokens = torch.stack((torch.where(ex['event_types']==0,labels[:,0],labels[:,1]),
-                                  labels[:,2].clamp_min(0),labels[:,3].clamp_min(0)),dim=-1)
+                                  labels[:,2],labels[:,3].clamp_min(0)),dim=-1)
         rows.append(token_metrics(tokens,ref_tokens,events,to_continuous(tokens,events,model),reference))
     metrics = {k:float(np.mean([r[k] for r in rows if k in r]))
                for k in set().union(*(r.keys() for r in rows))}
     metrics['selection_score'] = (metrics['beat_duration_log_mae'] + metrics['note_duration_log_mae']
                                   + metrics['onset_mae'] + metrics['velocity_mae']/127)/4
+    for name, values in component_losses.items():
+        if values:
+            metrics[f'{name}_ce'] = float(np.mean(values))
     return dict(windows=len(rows),loss=float(np.mean(losses)),metrics=metrics)
 
 
-def reference_tokens(events,targets,run):
-    example = quantized_example(events,targets,run)
+def reference_tokens(events,targets,run,target_valid=None):
+    example = quantized_example(events,targets,run,target_valid)
     labels = example['labels']
     return torch.stack((torch.where(example['event_types']==0,labels[:,0],labels[:,1]),
-                        labels[:,2].clamp_min(0),labels[:,3].clamp_min(0)),dim=-1)
+                        labels[:,2],labels[:,3].clamp_min(0)),dim=-1)
 
 
-def evaluate_test(model,run,path,device,output,samples=3,limit=None):
+def evaluate_test(model,run,path,device,output,samples=3,limit=None,
+                  work_start=None, work_end=None):
     payload = torch.load(path,map_location='cpu',weights_only=False)
     groups = {}
     for row in payload['performances']:
         groups.setdefault(row['work'],[]).append(row)
     work_rows = []
-    for work_index,(work,performances) in enumerate(sorted(groups.items())):
-        if limit and work_index >= limit:
-            break
+    work_items = sorted(groups.items())
+    start = max(0, int(work_start or 0))
+    stop = len(work_items) if work_end is None else min(len(work_items), int(work_end))
+    if limit is not None:
+        stop = min(stop, start + int(limit))
+    for work_index,(work,performances) in enumerate(work_items[start:stop], start=start):
         work_dir = output / f'work_{work_index:02d}'
         work_dir.mkdir(parents=True,exist_ok=True)
         ready = work_dir / 'metrics.json'
@@ -350,15 +387,19 @@ def evaluate_test(model,run,path,device,output,samples=3,limit=None):
         chunks = event_chunks(events,run.get('window_notes',512),run.get('window_events'))
         length = chunks[-1][1]
         events = events[:length]
-        references, reference_token_arrays, reference_midis = [],[],[]
+        references, reference_token_arrays, reference_midis, reference_valid = [],[],[],[]
         for ref_index,row in enumerate(performances):
             start,end = row['span']
             if not torch.equal(payload['events'][start:start+length],events):
                 raise ValueError('Reference performances have different score event topology')
             reference = payload['targets'][start:start+length]
+            target_valid = (payload['target_valid'][start:start+length]
+                            if 'target_valid' in payload else torch.ones_like(reference, dtype=torch.bool))
             references.append(reference)
-            reference_token_arrays.append(reference_tokens(events,reference,run))
-            notes,_ = absolute_notes(events,reference.numpy())
+            reference_valid.append(target_valid)
+            reference_token_arrays.append(reference_tokens(events,reference,run,target_valid))
+            notes,_ = absolute_notes(events,reference.numpy(),
+                                     'dev' if payload['format'] == 'dinr_beat_events_v2' else 'ratio')
             export_midi(notes,work_dir/f'reference_{ref_index:03d}.mid')
             reference_midis.append(midi_arrays(notes))
         refs = torch.stack(references)
@@ -376,11 +417,14 @@ def evaluate_test(model,run,path,device,output,samples=3,limit=None):
                               if mode == 'teacher_forced' else ar_predictions[sample])
                     ar_tokens.append(tokens.numpy())
                     continuous = to_continuous(tokens,events,model)
-                    notes,_ = absolute_notes(events,continuous)
+                    notes,_ = absolute_notes(events,continuous,model.onset_target)
                     export_midi(notes,work_dir/f'{mode}_{sample:02d}_history_{history:03d}.mid')
                     array = midi_arrays(notes)
+                    metric_refs = refs.clone()
+                    if payload['format'] == 'dinr_beat_events_v2' and model.onset_target != 'dev':
+                        metric_refs[:, :, 1] += events[None, :, 3]
                     comparison = [token_metrics(tokens,rt,events,continuous,r.numpy())
-                                  for rt,r in zip(ref_tokens,refs)]
+                                  for rt,r in zip(ref_tokens,metric_refs)]
                     row_metrics = {k:float(np.mean([r[k] for r in comparison])) for k in comparison[0]}
                     for col,name in enumerate(('ioi','duration','velocity')):
                         # W1(single generated value, human values) equals mean absolute error.
@@ -393,7 +437,8 @@ def evaluate_test(model,run,path,device,output,samples=3,limit=None):
                     row_metrics['pn_hr'] = float(np.mean([row_metrics[n+'_hr'] for n in ANCHORS]))
                     metrics.append(row_metrics)
                 np.savez_compressed(work_dir/f'{mode}_{sample:02d}_tokens.npz',
-                                    predictions=np.stack(ar_tokens),references=ref_tokens.numpy(),events=events.numpy())
+                                    predictions=np.stack(ar_tokens),references=ref_tokens.numpy(),events=events.numpy(),
+                                    reference_continuous=refs.numpy(),reference_valid=torch.stack(reference_valid).numpy())
                 mode_rows.append(dict(mode=mode,sample=sample,metrics={k:float(np.mean([r[k] for r in metrics])) for k in metrics[0]}))
         result = dict(work=work,notes=int((events[:,0]==1).sum()),beats=int((events[:,0]==0).sum()),
                       references=len(refs),rows=mode_rows)
@@ -422,12 +467,15 @@ def main():
     parser.add_argument('--device',default='cuda:0')
     parser.add_argument('--samples',type=int,default=3)
     parser.add_argument('--limit',type=int)
+    parser.add_argument('--work-start',type=int)
+    parser.add_argument('--work-end',type=int)
     args=parser.parse_args()
     args.output_dir.mkdir(parents=True,exist_ok=True)
     device=torch.device(args.device)
     model,run=load_model(args.checkpoint,device)
     result=(evaluate_valid(model,run,args.sidecar,device,args.limit) if args.split=='valid' else
-            evaluate_test(model,run,args.sidecar,device,args.output_dir,args.samples,args.limit))
+            evaluate_test(model,run,args.sidecar,device,args.output_dir,args.samples,args.limit,
+                          args.work_start,args.work_end))
     atomic_json(args.output_dir/'metrics.json',result)
     print(json.dumps({k:v for k,v in result.items() if k not in ('work_rows','rounds')},indent=2),flush=True)
 

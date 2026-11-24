@@ -40,10 +40,11 @@ def atomic(path,value):
 
 
 def spec(identifier,target='absolute_log',tables='shared',head='separate',measure=True,
-         beat=None,note=None,seeds=SEEDS,source=None):
+         beat=None,note=None,seeds=SEEDS,source=None,onset_target='ratio'):
     return dict(id=identifier,duration_target=target,beat_duration_target=beat or target,
                 note_duration_target=note or target,duration_input_tables=tables,
-                duration_output_head=head,measure_start=measure,seeds=list(seeds),source=source)
+                duration_output_head=head,measure_start=measure,seeds=list(seeds),source=source,
+                onset_target=onset_target)
 
 
 BASE=[spec('A1'),spec('A2',target='log_dev'),spec('A3',measure=False),
@@ -76,6 +77,8 @@ class Supervisor:
             atomic(self.manifest_path,self.manifest)
 
     def report(self):
+        if self.experiment == 'exp1117':
+            return
         if time.monotonic()-self.last_report < 60:
             return
         if not self.report_lock.acquire(blocking=False):
@@ -83,8 +86,11 @@ class Supervisor:
         try:
             self.last_report=time.monotonic()
             with (self.run_dir/'report.log').open('a') as log:
-                result=subprocess.run([sys.executable,str(ROOT/'script/report_dinr_beat.py'),
-                                       '--campaign',str(self.run_dir),'--experiment',self.experiment],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+                report_command=[sys.executable,str(ROOT/'script/report_dinr_beat.py'),
+                                '--campaign',str(self.run_dir),'--experiment',self.experiment]
+                if self.experiment == 'exp1116':
+                    report_command.extend(['--doc-path','docs/exp1115_BEAT.md'])
+                result=subprocess.run(report_command,cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
                 if result.returncode:
                     print('Report generation failed; see report.log',flush=True)
         finally:
@@ -110,6 +116,8 @@ class Supervisor:
     def execute(self,job,gpu):
         directory=Path(job['run_dir'])
         directory.mkdir(parents=True,exist_ok=True)
+        job.pop('error', None)
+        job.pop('traceback', None)
         env={**os.environ,'CUDA_VISIBLE_DEVICES':str(gpu),'OMP_NUM_THREADS':'4','MKL_NUM_THREADS':'4',
              'TOKENIZERS_PARALLELISM':'false','PYTHONUNBUFFERED':'1'}
         s=job['config']
@@ -146,6 +154,7 @@ class Supervisor:
                              '--note-duration-target',s['note_duration_target'],
                              '--duration-input-tables',s['duration_input_tables'],
                              '--duration-output-head',s['duration_output_head'],
+                             '--onset-target',s.get('onset_target','ratio'),
                              '--measure-start' if s['measure_start'] else '--no-measure-start']
                     if self.fixed_event_length:
                         command.extend(['--fixed-event-length',str(self.fixed_event_length)])
@@ -275,7 +284,7 @@ def main():
     args.run_dir.mkdir(parents=True,exist_ok=True)
     with (args.run_dir/'supervisor.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        audit=json.loads((ROOT/'docs/design1115_beat_data_audit.json').read_text())
+        audit=json.loads((ROOT/'analysis/design1115_beat_data_audit.json').read_text())
         if audit['status']!='passed' or audit['splits']['test']['works']!=19:
             raise RuntimeError('Data audit must pass with all 19 test works')
         for split,row in audit['splits'].items():
