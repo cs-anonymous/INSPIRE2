@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from pathlib import Path
 
 import torch
@@ -14,6 +15,23 @@ def fixed_event_spans(event_count, block_events=512):
         raise ValueError('block_events must be positive')
     return [(start, min(start + block_events, event_count))
             for start in range(0, event_count, block_events)]
+
+
+def measure_event_spans(events, block_events=512):
+    """Partition a complete event stream at measure boundaries."""
+    boundaries = torch.nonzero(events[:, 0] == BeatTokenSpec.beat_type).flatten().tolist()
+    if not boundaries or boundaries[0] != 0:
+        raise ValueError('Expected a stream beginning with a MEASURE event')
+    boundaries.append(len(events))
+    chunks = []
+    i = 0
+    while i < len(boundaries) - 1:
+        end = bisect_right(boundaries, boundaries[i] + block_events) - 1
+        if end <= i:
+            raise ValueError('A measure exceeds the event cap')
+        chunks.append((boundaries[i], boundaries[end]))
+        i = end
+    return chunks
 
 
 class BeatTokenSpec:

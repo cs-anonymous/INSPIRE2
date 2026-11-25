@@ -190,13 +190,17 @@ def predict(model, events, targets, run, device, seed, teacher_forced=False, gre
 
 
 @torch.inference_mode()
-def predict_many(model, events, targets, run, device, seeds, batch_size=16):
+def predict_many(model, events, targets, run, device, seeds, batch_size=16, *, chunks=None,
+                 score_velocity_feedback=False, mean_measure_duration=False):
     """Batch independent complete-beat windows and sampling draws for AR."""
-    chunks = event_chunks(events,run.get('window_notes',512),run.get('window_events'))
+    if chunks is None:
+        chunks = event_chunks(events,run.get('window_notes',512),run.get('window_events'))
     tasks = [(sample,left,right) for sample in range(len(seeds)) for left,right in chunks]
     pieces = [[] for _ in seeds]
     # Fixed task order and batch size are part of the replay protocol.
     generator = torch.Generator(device=device).manual_seed(seeds[0])
+    if mean_measure_duration:
+        duration_bins = torch.arange(S.duration_bins, device=device, dtype=torch.float32)
     for offset in range(0,len(tasks),batch_size):
         group = tasks[offset:offset+batch_size]
         examples = [quantized_example(events[left:right],targets[left:right],run)
@@ -221,12 +225,17 @@ def predict_many(model, events, targets, run, device, seeds, batch_size=16):
                 cache=output['past_key_values']
                 row=torch.stack([draw(output['logits'][k][:,0],generator)
                                  for k in ('duration','onset','velocity')],dim=-1)
+                if mean_measure_duration:
+                    # Keep the sampling stream intact for the other attributes.
+                    mean = (output['logits']['duration'][:, 0].float().softmax(-1) @ duration_bins).round().long()
+                    row[:, 0] = torch.where(types[:, i] == S.beat_type, mean, row[:, 0])
                 predicted.append(row)
                 previous=encoder[:,i:i+1].clone()
                 duration=decode_duration(row[:,0],raw[:,i],model)
                 previous[...,2]=S.quantize(duration.log(),S.duration_abs_range,S.duration_bins)[:,None]
                 previous[...,3]=onset_feedback_token(row[:,1],raw[:,i],model)[:,None]
-                previous[...,4]=row[:,2,None]
+                if not score_velocity_feedback:
+                    previous[...,4]=row[:,2,None]
         predicted=torch.stack(predicted,dim=1).cpu()
         for index,(sample,left,right) in enumerate(group):
             pieces[sample].append(predicted[index,:right-left])

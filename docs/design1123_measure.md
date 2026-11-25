@@ -154,96 +154,56 @@ MEASURE(score_measure_duration)
 
 可用 `python INSPIRE2/script/analyze_exp1123_measure.py` 从仓库根目录重算。 [逐划分和逐作品统计 JSON](../analysis/design1123_measure/statistics.json) · [统计与绘图脚本](../script/analyze_exp1123_measure.py) · [1115 拍级设计](design1115_beat.md) · [1122 锚点规则与参考](exp1122.md)
 
-## 6. PT 小节级五项指标
+## 6. 官方 ASAP 划分与小节级评估
 
-使用同一批已保存 MIDI。**PT base** 和 **PT rendering** 分别为官方预训练权重和官方渲染权重。**PT-1** 从 PT base 初始化，在本地 ASAP 划分上做渲染 SFT，使用 exp1111 首个 epoch 的最佳权重 `checkpoint-643`。三种 PT 各有三轮采样。 [PT-1 训练记录](exp1111_DINR_VAR.md#7-半-epoch-validation--early-stopping-重跑)
+### 6.1 数据划分
 
-Tempo Pearson 使用 §4 的小节级四分音符等效 BPM。Velocity Pearson 使用每小节新起音音符的平均力度。Onset MAE 使用 §3.6 的小节内百分比，单位为百分点。Duration 和 Velocity MAE 分别使用音符时长 log ratio 和 MIDI velocity。人类参考沿用 1122 的全曲归一化，PT 与 Score MIDI 使用文件保存的时间尺度。每项按作品等权汇总。PT 的 Pearson 先对每轮生成与逐份人类参考计算相关，`±` 为三轮采样的样本标准差。PT 的 MAE 在每个谱面音符上比较三轮生成均值与人类参考均值。
+按官方脚本对 `midi_score` 路径排序，再以 seed 42 打乱，前 10% 划为 Test。表中谱面数按 MIDI 路径计。HMM 对齐后保留有可用片段的演奏。
 
-### 6.1 完整测试集
-
-19 首作品、82 份人类演奏。PT 的两项 Pearson 均覆盖 19 首作品。Score MIDI 有 7 首的有效小节速度曲线恒定，其 Tempo Pearson 在其余 12 首上汇总。其他各项使用 19 首作品。
-
-| 方法 | 小节 Tempo Pearson ↑ | 小节 Velocity Pearson ↑ | 小节内 Onset MAE ↓（百分点） | 音符 Duration MAE ↓（log ratio） | 音符 Velocity MAE ↓ |
-|---|---:|---:|---:|---:|---:|
-| PT base | 0.100 ± 0.009 | 0.390 ± 0.012 | 2.949 | 0.758 | 19.627 |
-| PT rendering | 0.457 ± 0.005 | 0.616 ± 0.026 | 1.998 | 0.435 | 8.517 |
-| PT-1 | 0.255 ± 0.007 | 0.429 ± 0.020 | 2.442 | 0.549 | 13.743 |
-| Score MIDI | 0.559 | 0.537 | 2.349 | 0.709 | 21.969 |
-
-按官方 SFT 脚本重建 ASAP 划分后，本地 19 首测试作品有 17 首对应到官方配方的训练谱面路径。其余 2 首是 Beethoven Op.111 第一乐章和 Mozart K.475，共 10 份本地人类参考。只重算这 2 首时，PT rendering 与 PT-1 的 Tempo Pearson 为 0.779 和 0.758，Velocity Pearson 为 0.644 和 0.585。样本量只支持这两首的描述性比较，19 首的结果也无法单独衡量两种 SFT 配方的泛化差异。 [谱面对照](../../results/pt_rendering_public_recipe_20261124/split_comparison.json) · [按官方划分重算的五项指标](../../results/pt_rendering_public_recipe_20261124/local_metrics_by_public_split.json)
-
-### 6.2 人类留一对照
-
-取至少有两份演奏的 12 首作品、75 份人类演奏。每次留出一份演奏作为 Human 预测，三种 PT 和 Score MIDI 都与同一组剩余参考比较。先在作品内平均各次留一结果，再对作品等权平均。所有方法的 Tempo Pearson 使用同样的 9 首曲目，其余 3 首的 Score 速度曲线恒定。Velocity Pearson 和三项 MAE 均覆盖 12 首。Human 每次使用一份留出演奏，PT 的 MAE 使用三轮生成均值。
-
-| 方法 | 小节 Tempo Pearson ↑ | 小节 Velocity Pearson ↑ | 小节内 Onset MAE ↓（百分点） | 音符 Duration MAE ↓（log ratio） | 音符 Velocity MAE ↓ |
-|---|---:|---:|---:|---:|---:|
-| Human（留一） | 0.773 | 0.790 | 1.903 | 0.367 | 8.361 |
-| Score MIDI | 0.609 | 0.558 | 2.313 | 0.710 | 21.033 |
-| PT base | 0.208 ± 0.014 | 0.395 ± 0.013 | 3.030 | 0.769 | 18.173 |
-| PT rendering | 0.616 ± 0.025 | 0.642 ± 0.021 | 1.833 | 0.387 | 7.675 |
-| PT-1 | 0.421 ± 0.040 | 0.433 ± 0.028 | 2.448 | 0.526 | 13.494 |
-
-[五项指标 CSV](../../results/pt_official_base_vs_rendering_20261123/five_metrics_measure.csv) · [逐作品与共同有效范围](../../results/pt_official_base_vs_rendering_20261123/five_metrics_measure.json) · [重算脚本](../../results/pt_official_base_vs_rendering_20261123/summarize_measure.py)
-
-### 6.3 官方 ASAP 划分上的 rendering 复训
-
-从官方 PT base 初始化，使用发布版训练脚本和重新构建的 ASAP HMM 数据。206 个训练谱面路径、918 份训练演奏，23 个测试谱面路径、101 份真人测试演奏。沿用发布版的谱面路径划分，同一乐章的不同反复版本可能跨划分。SFT 保留演奏的毫秒时间尺度和完整 decoder 历史，每 10 个 optimizer step 记录一次验证 loss，固定训练两轮并使用最终权重。三卡 DDP 每卡 micro-batch 1、累积 11 次，有效 batch 33。其余优化和窗口设置沿用官方配置。
-
-PT base、官方 PT rendering 和本次复训的 PT2 均对每首谱面生成三次。发布版权重按 batch 4 推理，PT2 用三卡各跑一轮采样，每卡 8 个进程按曲目并行，三轮 seed 为 42、43、44。所有模型使用相同的谱面和人类参考，采样温度为 1、top-p 为 0.95、窗口 4096 token、重叠 50%。Human 留一对照包含至少两份演奏的 19 份谱面。
-
-三卡复训完成了两轮、1,272 步，step 1,270 的最后一次定期验证 loss 为 1.5657。在官方测试划分上用相同的 1,164 个固定窗口和真实 decoder 历史重算，PT2 和官方 PT rendering 的 token loss 分别为 1.5622 和 1.5611。 [PT2 token loss](../../results/pt_rendering_public_recipe_20261124/official_split_measure/pt2_token_loss.json) · [官方 PT rendering token loss](../../results/pt_rendering_public_recipe_20261124/official_split_measure/official_rendering_token_loss.json)
-
-在完整测试集的 23 份谱面上，三种 PT 使用共同有效的音符和小节位置。PT2 完成了 69 份整曲 MIDI。两项 Pearson 的 `±` 为三轮采样的样本标准差。
-
-| 方法 | 小节 Tempo Pearson ↑ | 小节 Velocity Pearson ↑ | 小节内 Onset MAE ↓（百分点） | 音符 Duration MAE ↓（log ratio） | 音符 Velocity MAE ↓ |
-|---|---:|---:|---:|---:|---:|
-| PT base | 0.004 ± 0.012 | 0.348 ± 0.014 | 2.220 | 0.603 | 19.750 |
-| 官方 PT rendering | 0.331 ± 0.019 | 0.497 ± 0.015 | 1.817 | 0.525 | 9.508 |
-| PT2 | 0.346 ± 0.039 | 0.479 ± 0.042 | 1.771 | 0.545 | 9.060 |
-
-留一对照中，各方法共同使用 5 首曲目计算 Tempo Pearson、17 首计算 Velocity Pearson、19 首计算三项 MAE。
-
-| 方法 | 小节 Tempo Pearson ↑ | 小节 Velocity Pearson ↑ | 小节内 Onset MAE ↓（百分点） | 音符 Duration MAE ↓（log ratio） | 音符 Velocity MAE ↓ |
-|---|---:|---:|---:|---:|---:|
-| Human（留一） | 0.628 | 0.771 | 1.760 | 0.375 | 8.738 |
-| Score MIDI | 0.226 | 0.454 | 2.020 | 0.577 | 23.070 |
-| PT base | 0.189 | 0.367 | 2.241 | 0.607 | 20.240 |
-| 官方 PT rendering | 0.381 | 0.520 | 1.882 | 0.525 | 9.560 |
-| PT2 | 0.399 | 0.507 | 1.849 | 0.550 | 9.084 |
-
-[完整测试与留一对照 CSV](../../results/pt_rendering_public_recipe_20261124/official_split_measure/five_metrics_measure.csv) · [逐谱面结果与有效范围](../../results/pt_rendering_public_recipe_20261124/official_split_measure/five_metrics_measure.json) · [PT2 推理清单](../../results/pt_rendering_public_recipe_20261124/official_split_measure/rendering_reproduced/prediction_manifest.json) · [三卡复训完成记录](../../results/pt_rendering_public_recipe_20261124/official_ddp_3gpu/completion.json)
-
-[复训划分审计](../../results/pt_rendering_public_recipe_20261124/dataset_audit.json) · [三卡复训配置](../../results/pt_rendering_public_recipe_20261124/official_ddp_3gpu/official_sft_config.json) · [评估脚本](../../results/pt_rendering_public_recipe_20261124/official_split_measure/score_official_split.py)
-
-## 7. Measure A2 三卡训练
-
-从 exp1122 的冻结 sidecar 继承作品划分、对齐演奏和全曲 beat-median 归一化。以 `MEASURE` 替换结构事件，用最早起音规则定位演奏小节边界。音符 onset 目标为 §3.6 的线性比例差，sidecar 储存 0–1 比例坐标，评分换算成百分点。音符时长、力度和 pitch 沿用原始对齐标签。无有效锚点的位置屏蔽相应的时长或 onset loss。
-
-每个窗口包含最多 512 个 `MEASURE + NOTE` 总事件，步长 256，相邻窗口重叠 50%。窗口允许从音符开始，尾窗补齐到 512，窗口完全位于同一份演奏内。三个 split 的作品互斥。
-
-| 划分 | 作品 | 演奏 | 连续总事件 | 重叠窗口 |
+| 划分 | 对齐前谱面路径 | 对齐前演奏 | 对齐后谱面路径 | 对齐后演奏 |
 |---|---:|---:|---:|---:|
-| Train | 175 | 837 | 2,880,321 | 10,770 |
-| Valid | 12 | 47 | 143,895 | 535 |
-| Test | 19 | 82 | 416,862 | 1,601 |
+| Train | 212 | 966 | 206 | 918 |
+| Test | 23 | 101 | 23 | 101 |
 
-采用 exp1122 A2 的随机初始化、BF16、seed 42、`3e-4` 学习率、独立时长输出头和共享时长输入表。小节和音符时长输出均为 log-dev，onset 为 200 类线性比例偏差。输入及 decoder 历史的绝对 log 时长范围沿用 `[3, 8]`。三卡 DDP 每卡 batch 16、累积 1，有效 batch 48。每半 epoch 验证，连续四次未改善即早停。
+训练期间的 Valid loss 在同一批 23 首 Test 谱面上计算。PT2 从官方 PT base 初始化，按官方 SFT 配方固定训练两轮并使用最终权重。路径划分中有两个测试乐章的不同反复版本落在训练侧。 [划分清单](../../results/pt_rendering_public_recipe_20261124/score_split.json) · [数据审计](../../results/pt_rendering_public_recipe_20261124/dataset_audit.json) · [PT2 训练记录](../../results/pt_rendering_public_recipe_20261124/official_ddp_3gpu/completion.json)
 
-最佳验证 CE 为 **15.6715**，位于 step **563**（约 epoch **2.5**）。训练在 step **1013**（约 epoch **4.5**）早停。
+### 6.2 小节级五项指标
 
-[Sidecar 审计](../../data/ASAP_processed_dinr_measure_structural_earliest_e512_o50_v1/audit.json) · [数据构建脚本](../script/prepare_exp1123_measure.py) · [训练入口](../script/run_exp1123_a2_measure_3gpu.py) · [训练摘要](../../results/exp1123_A2_measure_3gpu_bs48_e512_o50/training_summary.json)
+PT base、官方 PT rendering、PT2 和 Score MIDI 均使用完整的 23 首测试谱面和 101 份人类参考。三个 PT 模型每首各生成三次，Pearson 的 `±` 为三次采样的样本标准差，MAE 比较三次生成的逐音符均值和人类参考均值。人类参考按 exp1122 做全曲 beat-median 归一化。Human 使用其中至少有两份演奏的 19 首、97 份演奏，每次留出一份演奏与该曲剩余演奏比较，先在曲目内平均。所有指标按曲目等权汇总。
 
-### 7.1 小节级五项测试结果
+Tempo Pearson 使用小节四分音符等效 BPM，Velocity Pearson 使用小节内新起音音符的平均力度。Onset MAE 以小节内位置的百分点计，Duration MAE 以音符时长的自然对数比值计，Velocity MAE 以 MIDI 力度单位计。Human 的两项 Pearson 均覆盖 19 首，三个 PT 均覆盖 23 首。Score MIDI 的恒定曲线对应的 Pearson 无定义，Tempo 和 Velocity Pearson 分别由 6 首和 20 首汇总，三项 MAE 仍覆盖 23 首。
 
-在 19 首作品上各生成三次。整曲自回归沿用 exp1122 的推理协议，把谱面连续划分为不重叠的 512-event 推理块，每块重置 BOS 和 cache。训练、验证和测试的 sidecar 窗口均按 50% 重叠构建。先将生成事件拼回整曲，再根据小节时长与 onset 偏差还原音符。谱面首末起音范围以外的小节用谱面时长回退。按 MIDI 毫秒精度还原后，从对齐音符用 §2 规则重新提取小节锚点，与 §6 的 PT 结果使用相同的五项指标和共同有效范围。
+| 方法 | 测试谱面 | 小节 Tempo Pearson ↑ | 小节 Velocity Pearson ↑ | 小节内 Onset MAE ↓（百分点） | 音符 Duration MAE ↓（log ratio） | 音符 Velocity MAE ↓ |
+|---|---:|---:|---:|---:|---:|---:|
+| PT base | 23 | 0.004 ± 0.012 | 0.348 ± 0.014 | 2.220 | 0.603 | 19.750 |
+| PT rendering | 23 | 0.331 ± 0.019 | 0.497 ± 0.015 | 1.817 | 0.525 | 9.508 |
+| PT2 | 23 | 0.346 ± 0.039 | 0.479 ± 0.042 | 1.771 | 0.545 | 9.060 |
+| Score MIDI | 23 | 0.313 | 0.489 | 1.980 | 0.580 | 22.419 |
+| Human（留一） | 19 | 0.612 | 0.750 | 1.760 | 0.375 | 8.738 |
 
-| Measure A2 | 小节 Tempo Pearson ↑ | 小节 Velocity Pearson ↑ | 小节内 Onset MAE ↓（百分点） | 音符 Duration MAE ↓（log ratio） | 音符 Velocity MAE ↓ |
-|---|---:|---:|---:|---:|---:|
-| 完整测试集 | 0.272 ± 0.004 | 0.172 ± 0.020 | 2.888 | 0.689 | 14.784 |
-| 人类留一匹配 | 0.435 ± 0.009 | 0.201 ± 0.011 | 2.884 | 0.686 | 14.627 |
+[完整测试指标 CSV](../../results/pt_rendering_public_recipe_20261124/official_split_measure/five_metrics_measure.csv) · [逐谱面指标 JSON](../../results/pt_rendering_public_recipe_20261124/official_split_measure/five_metrics_measure.json) · [PT2 推理清单](../../results/pt_rendering_public_recipe_20261124/official_split_measure/rendering_reproduced/prediction_manifest.json)
 
-完整测试集使用 19 首作品。留一匹配沿用 §6.2，Tempo Pearson 使用 9 首，其余四项使用 12 首。完整测试集的 Measure A2 Tempo Pearson 数值略高于 PT-1（0.272 vs. 0.255），其余四项均低于 PT-1 的表现。力度曲线的差距最大（0.172 vs. 0.429）。
+### 6.3 Measure A2 与 PT2 的窗口对比
 
-[包含 PT 与 Human 基线的五项指标 CSV](../../results/exp1123_A2_measure_3gpu_bs48_e512_o50/five_metrics_measure.csv) · [逐作品明细](../../results/exp1123_A2_measure_3gpu_bs48_e512_o50/five_metrics_measure.json) · [推理记录](../../results/exp1123_A2_measure_3gpu_bs48_e512_o50/test_24proc/dispatch.json)
+Measure A2 与 PT2 使用相同的官方划分和 HMM 保留音符。Train 有 206 份谱面、918 份演奏、2,838,143 个保留音符。Test / Valid 有 23 份谱面、101 份演奏、314,477 个保留音符。每窗平均音符数为原窗和裁剪窗内的音符出现次数之和除以总窗口数，计数单位为 `NOTE` 事件。
+
+| 划分 | 模型 | 原窗 | 裁剪窗 | 总窗口 | 窗口内音符出现次数 | 每窗平均音符数 |
+|---|---|---:|---:|---:|---:|---:|
+| Train | PT2 | 10,490 | 10,490 | 20,980 | 7,469,754 | 356.04 |
+| Train | Measure A2 | 11,534 | 11,534 | 23,068 | 9,384,326 | 406.81 |
+| Test / Valid | PT2 | 1,164 | 1,164 | 2,328 | 858,428 | 368.74 |
+| Test / Valid | Measure A2 | 1,284 | 1,284 | 2,568 | 1,036,399 | 403.58 |
+
+[窗口对比 CSV](../../data/ASAP_official_dinr_measure_structural_e512_snap50_crop_v1/comparison.csv) · [Measure A2 数据审计](../../data/ASAP_official_dinr_measure_structural_e512_snap50_crop_v1/audit.json)
+
+### 6.4 Measure A2 的直接小节速度评估
+
+Measure A2 实验固定使用 §6.1 的官方 Train/Test 划分。评估直接用输出 `MEASURE` 的时长 $D_m$ 计算 $60000q_m/D_m$。PT 和 Human 的小节边界仍由各自 MIDI 的起音映射。
+
+第 700 步 checkpoint 在 23 首 Test 上直接计算得到 Tempo Pearson **0.079**。旧评估把生成音符的起音重新映射到小节，得到 **0.080**。按谱面速度分组，17 首谱面速度恒定的曲目平均为 **0.015**，6 首谱面自带速度变化的曲目平均为 **0.263**。每首曲目先对各次生成和各份参考取平均，再对曲目等权平均。 [直接评估的五项指标](../results/exp1123_a2_degradation_audit_20261124/native_measure_tempo/five_metrics_measure.csv) · [逐曲目诊断](../results/exp1123_a2_degradation_audit_20261124/tempo_diagnostic.json)
+
+保持整曲自回归，只将 `MEASURE` 的 log-duration deviation 从采样改成预测分布的均值，Tempo Pearson 为 **0.112**。在谱面速度恒定的 17 首上为 **0.029**。用真人演奏历史诊断时，`MEASURE` 时长预测分布的均值给出 **0.266**。在同样的诊断里，只保留真人 `NOTE` 历史时为 **0.260**，只保留真人 `MEASURE` 历史时为 **0.141**，其余历史字段均用谱面填充。 [整曲生成对照](../results/exp1123_a2_degradation_audit_20261124/tempo_sampling_comparison.json) · [历史替换诊断](../results/exp1123_a2_degradation_audit_20261124/tempo_diagnostic.json)
+
+下图选自官方 Test 的六首谱面。§4 原来的五首在当前划分中都属于 Train。Human、PT2 和 A2 曲线分别取各份演奏或三次生成的小节 BPM 中位数。A2 使用输出小节时长，PT2 使用生成起音映射得到的小节时长。图中的相关系数按单次生成与单份真人演奏计算，然后取平均。缺少共同对齐支持的小节留空。 [绘图数据 CSV](../results/exp1123_a2_degradation_audit_20261124/tempo_curve_comparison/measure_tempo_curves.csv)
+
+![官方 Test 六首的 Score MIDI、Human、PT2 和 A2 小节速度曲线](../results/exp1123_a2_degradation_audit_20261124/tempo_curve_comparison/measure_tempo_curves.png)

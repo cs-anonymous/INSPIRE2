@@ -1,4 +1,4 @@
-"""Train one beat-aware DINR experiment with half-epoch validation."""
+"""Train a beat-aware DINR experiment with periodic validation."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 import torch
-from transformers import EarlyStoppingCallback, Trainer, TrainingArguments, set_seed
+from transformers import EarlyStoppingCallback, TrainerCallback, TrainingArguments, set_seed
 
 from src.data_process.dinr_beat_dataset import DINRBeatCollator, DINRBeatDataset
 from src.model.dinr_beat import DINRBeatModel
@@ -41,6 +41,13 @@ class BeatTrainer(BestOnlyTrainer):
         self.model.save_pretrained(output_dir or self.args.output_dir)
 
 
+class SaveAtValidationCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        # Transformers also requests a save on the final optimizer step.
+        control.should_save &= control.should_evaluate
+        return control
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-sidecar", type=Path, default=Path("../data/ASAP_processed_dinr_beat_v1/dinr_beat_train_b512_o50.pt"))
@@ -64,6 +71,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-seed", type=int, default=None)
+    parser.add_argument("--eval-steps", type=int, help="Validate every N optimizer steps instead of every half epoch")
     parser.add_argument("--early-stopping-patience", type=int, default=4)
     parser.add_argument("--load-best-model-at-end", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hidden-size", type=int, default=768)
@@ -76,6 +84,10 @@ def main():
     parser.add_argument("--limit-train", type=int, default=None)
     parser.add_argument("--limit-valid", type=int, default=None)
     args = parser.parse_args()
+    if args.eval_steps is not None and args.eval_steps <= 0:
+        parser.error('--eval-steps must be positive')
+    if args.early_stopping_patience < 0:
+        parser.error('--early-stopping-patience must be nonnegative; zero disables early stopping')
     if not torch.cuda.is_available():
         raise RuntimeError("Beat experiments require CUDA")
     set_seed(args.seed)
@@ -129,8 +141,14 @@ def main():
         "window_policy": train.data.get("window_policy", "whole_beat_note_cap"),
         "measure_start_vocab_size": model.measure_start_vocab_size,
     })
-    if int(__import__('os').environ.get('RANK', '0')) == 0:
+    if int(os.environ.get('RANK', '0')) == 0:
         (args.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, default=str) + "\n")
+    cadence = 'steps' if args.eval_steps is not None else 'epoch'
+    step_intervals = {} if args.eval_steps is None else dict(eval_steps=args.eval_steps, save_steps=args.eval_steps)
+    callbacks = [SaveAtValidationCallback()] if args.eval_steps is not None else [HalfEpochValidationCallback()]
+    if args.early_stopping_patience:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
+    callbacks.append(LiveLossHistoryCallback())
     training_args = TrainingArguments(
         output_dir=str(args.output_dir),
         num_train_epochs=args.epochs,
@@ -142,8 +160,8 @@ def main():
         weight_decay=args.weight_decay,
         seed=args.seed,
         data_seed=data_seed,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_strategy=cadence,
+        save_strategy=cadence,
         save_total_limit=1,
         save_only_model=True,
         load_best_model_at_end=args.load_best_model_at_end,
@@ -157,6 +175,7 @@ def main():
         prediction_loss_only=True,
         remove_unused_columns=False,
         dataloader_num_workers=4,
+        **step_intervals,
     )
     trainer = BeatTrainer(
         model=model,
@@ -164,9 +183,7 @@ def main():
         train_dataset=train,
         eval_dataset=valid,
         data_collator=DINRBeatCollator(args.fixed_event_length),
-        callbacks=[HalfEpochValidationCallback(),
-                   EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   LiveLossHistoryCallback()],
+        callbacks=callbacks,
     )
     trainer.normalize_partial_accumulation = args.normalize_partial_accumulation
     trainer.train()
