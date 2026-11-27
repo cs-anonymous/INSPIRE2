@@ -41,13 +41,14 @@ class DINRChordModel(nn.Module):
         hidden = self.hidden(pitches, score, attention)
         return self.head_losses(hidden, attention, advances, labels)
 
-    def head_losses(self, hidden, attention, advances, labels):
+    def head_losses(self, hidden, attention, advances, labels, velocity_state=None):
         ioi = attention & advances & (labels[..., 0] != -100)
         active = (ioi, attention, attention)
         sums = []
         for slot, (head, mask) in enumerate(zip((self.ioi_head, self.duration_head, self.velocity_head), active,
                                                 strict=True)):
-            sums.append(self.field_loss(slot, head(hidden[mask]), labels[..., slot][mask]))
+            inputs = velocity_state if slot == 2 and velocity_state is not None else hidden[mask]
+            sums.append(self.field_loss(slot, head(inputs), labels[..., slot][mask]))
         return torch.stack(sums), torch.stack([mask.sum() for mask in active])
 
     def field_loss(self, slot, logits, targets):

@@ -8,15 +8,36 @@ from torch.nn import functional as F
 
 from src.data_process.dinr_chord_dataset import (COARSE_TIMING_BINS, LOG_DEV_HIGH, LOG_DEV_LOW, TIMING_BINS,
                                                 log_dev_edges)
-from src.model.dinr_chord_ar import DINRChordARModel, sample_head
+from src.model.dinr_chord_ar import sample_head
+from src.model.dinr_chord_ar_input import DINRChordARInputModel
 
 OUTPUT_MODES = ('cat500', 'timing_dlm', 'all_dlm')
 DIRECT_DLM_MODES = ('timing_dlm_k3_direct', 'timing_dlm_k1_direct', 'all_dlm_k1_direct')
 
 
-class DINRChordAROutputModel(DINRChordARModel):
-    def __init__(self, output_mode):
-        super().__init__()
+def compact_timing_heads(model, dlm_slots=(), components=1):
+    representatives = ((torch.arange(COARSE_TIMING_BINS) + 0.5) * (TIMING_BINS - 1) /
+                       COARSE_TIMING_BINS).round().long()
+    feedback_rows = torch.cat((representatives, torch.tensor([TIMING_BINS, TIMING_BINS + 1])))
+    for slot, name in enumerate(('ioi_head', 'duration_head', 'velocity_head')):
+        head = getattr(model, name)
+        if slot in dlm_slots:
+            outputs = 2 if components == 1 else 3 * components
+            setattr(model, name, nn.Linear(head.in_features, outputs))
+        elif slot < 2:
+            reduced = nn.Linear(head.in_features, COARSE_TIMING_BINS)
+            with torch.no_grad():
+                reduced.weight.copy_(head.weight[representatives])
+                reduced.bias.copy_(head.bias[representatives])
+            setattr(model, name, reduced)
+        if slot < 2:
+            selected = model.feedback_tables[slot].weight.detach()[feedback_rows]
+            model.feedback_tables[slot] = nn.Embedding.from_pretrained(selected, freeze=False)
+
+
+class DINRChordAROutputModel(DINRChordARInputModel):
+    def __init__(self, output_mode, score_input=None):
+        super().__init__(score_input)
         if output_mode not in (*OUTPUT_MODES, *DIRECT_DLM_MODES):
             raise ValueError(f'Invalid chord output: {output_mode}')
         self.output_mode = output_mode
@@ -27,23 +48,7 @@ class DINRChordAROutputModel(DINRChordARModel):
                           'all_dlm_k1_direct': (0, 1, 2)}[output_mode]
         self.register_buffer('timing_edges', log_dev_edges('cpu'), persistent=False)
         self.register_buffer('velocity_edges', torch.arange(129, dtype=torch.float32) - 0.5, persistent=False)
-        representatives = ((torch.arange(COARSE_TIMING_BINS) + 0.5) * (TIMING_BINS - 1) /
-                           COARSE_TIMING_BINS).round().long()
-        feedback_rows = torch.cat((representatives, torch.tensor([TIMING_BINS, TIMING_BINS + 1])))
-        for slot, name in enumerate(('ioi_head', 'duration_head', 'velocity_head')):
-            head = getattr(self, name)
-            if slot in self.dlm_slots:
-                outputs = 2 if self.components == 1 else 3 * self.components
-                setattr(self, name, nn.Linear(head.in_features, outputs))
-            elif slot < 2:
-                reduced = nn.Linear(head.in_features, COARSE_TIMING_BINS)
-                with torch.no_grad():
-                    reduced.weight.copy_(head.weight[representatives])
-                    reduced.bias.copy_(head.bias[representatives])
-                setattr(self, name, reduced)
-            if slot < 2:
-                selected = self.feedback_tables[slot].weight.detach()[feedback_rows]
-                self.feedback_tables[slot] = nn.Embedding.from_pretrained(selected, freeze=False)
+        compact_timing_heads(self, self.dlm_slots, self.components)
 
     @torch.no_grad()
     def initialize_from_training(self, payload):
@@ -99,7 +104,7 @@ class DINRChordAROutputModel(DINRChordARModel):
         edges = self.timing_edges if slot < 2 else self.velocity_edges
         return log_weights.log_softmax(-1), locations, F.softplus(raw_scales) + scale_floor(slot), edges
 
-    def decode_step(self, hidden, rng, temperature, top_p):
+    def decode_step(self, hidden, rng, temperature, top_p, advances=None):
         tokens, timing_locations = [], []
         for slot, head in enumerate((self.ioi_head, self.duration_head, self.velocity_head)):
             logits = head(hidden)

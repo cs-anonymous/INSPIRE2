@@ -28,7 +28,9 @@ from script.train_exp1125_chord import SEED
 from src.data_process.dinr_chord_dataset import COARSE_TIMING_BINS, TIMING_BINS, ChordBatches, MODES
 from src.model.dinr_chord import DINRChordModel
 from src.model.dinr_chord_ar import DINRChordARModel, sample_head
-from src.model.dinr_chord_ar_input import DINRChordARInputModel
+from src.model.dinr_chord_ar_input import DINRChordARInputModel, uses_raw_score
+from src.model.dinr_chord_ar_mlp128_output import (DINRChordARMLP128DLMModel, DINRChordARMLP128OutputModel,
+                                                  MLP128_DLM_MASK_MODES, MLP128_DLM_MODES)
 from src.model.dinr_chord_ar_output import DINRChordAROutputModel
 
 AR = RUN.parent / 'exp1125_chord_ar'
@@ -93,9 +95,13 @@ def init_worker(checkpoints, variant=None):
             model = DINRChordARInputModel(variant)
         elif architecture == 'ar_output':
             model = DINRChordAROutputModel(variant)
+        elif architecture == 'ar_mlp128_output':
+            dlm = variant in MLP128_DLM_MASK_MODES or variant in MLP128_DLM_MODES
+            model_class = DINRChordARMLP128DLMModel if dlm else DINRChordARMLP128OutputModel
+            model = model_class(variant)
         else:
             model = {'ar': DINRChordARModel, 'parallel': DINRChordModel}[architecture]()
-        model.load_state_dict(state, assign=True)
+        model.load_state_dict(state, assign=not getattr(model, 'velocity_tied', False))
         models[architecture] = model.to(device).eval()
 
 
@@ -107,7 +113,11 @@ def run_task(task):
         score = scores[task['work']]
         architecture = task.get('architecture', 'ar')
         timing_bins = COARSE_TIMING_BINS if architecture == 'ar_output' else TIMING_BINS
-        batches = ChordBatches(score, task['mode'], device, raw_score=architecture == 'ar_input',
+        raw_score = architecture == 'ar_input' and uses_raw_score(task['score_input'])
+        if architecture == 'ar_mlp128_output':
+            timing_bins = DINRChordARMLP128OutputModel.timing_bins(task['mlp128_output'])
+            raw_score = True
+        batches = ChordBatches(score, task['mode'], device, raw_score=raw_score,
                               timing_bins=timing_bins)
         batch = batches(torch.arange(len(batches)))
         attention = batch[2]
@@ -117,7 +127,7 @@ def run_task(task):
         locations = None
         continuous = task.get('continuous_output', False)
         with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            if architecture in ('ar', 'ar_input', 'ar_output'):
+            if isinstance(model, DINRChordARModel):
                 sampled = model.sample_windows(*batch[:4], rng, TEMPERATURE, TOP_P, return_locations=continuous)
             else:
                 choose = partial(sample_head, rng=rng, temperature=TEMPERATURE, top_p=TOP_P)
@@ -128,7 +138,7 @@ def run_task(task):
             tokens = sampled[attention].cpu()
         row = write_chord_prediction(task['work'], score, tokens, task['mode'], output / 'sample.mid',
                                      output / 'notes.npz', timing_bins=timing_bins)
-        if architecture == 'ar_output':
+        if architecture in ('ar_output', 'ar_mlp128_output'):
             advancing = score['score'][:, 0] > 0
             fields = (tokens[advancing, 0], tokens[:, 1], tokens[:, 2])
             row['edge_bins'] = {key: dict(low=int((field == 0).sum()), high=int((field == high).sum()), total=len(field))
